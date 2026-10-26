@@ -7,7 +7,8 @@ scaffold are not runtime dependencies. The image supports Linux amd64 and arm64.
 Build and inspect it locally:
 
 ```sh
-docker build -t page:local .
+docker buildx bake -f docker-bake.hcl app --set app.platform=linux/amd64 \
+  --set app.tags=page:local --load
 docker run --rm --network none --read-only page:local version
 ```
 
@@ -43,15 +44,42 @@ Temporary GitHub or S3 failures should not cause liveness restarts.
 
 ## Image publication
 
-The `image` workflow smoke-tests the container on every PR, then builds both
-architectures. Main, manual runs, and PRs whose source branch is in this
-repository publish to `ghcr.io/lesomnus/page`. Fork PRs build without registry
-credentials or publication.
+The `ci` workflow verifies the application before its `image` job runs. That
+job smoke-tests the stamped binary as non-root with a read-only filesystem,
+then builds amd64 and arm64 with `docker-bake.hcl`. PRs build without
+publication. Main, `v*` release tags and manual runs on main can publish to
+`ghcr.io/lesomnus/page`. The job follows the variable and tagging contract in
+[cr's CI](https://github.com/lesomnus/cr/blob/main/.github/workflows/ci.yml).
 
-Every publication has a `sha-<full-source-commit>` tag. Same-repository PRs also
-update `pr-<number>`; main updates `main`. The Actions job summary records the
-immutable image index digest. Production manifests should pin
-`ghcr.io/lesomnus/page@sha256:...`, including when reviewing a PR image.
+| Variable | Meaning / default |
+| --- | --- |
+| `REPO` | Image repository, `ghcr.io/lesomnus/page` |
+| `TAG` | `local` for local Bake; CI sets `edge`, or the `v*` release tag |
+| `BUILD_HASH` | OCI revision label; CI supplies the checked-out `github.sha` |
+| `BUILD_TIMESTAMP` | UTC build timestamp; CI shares one value across builds |
+| `BUILD_DATE` | `YYMMDD`, derived from `BUILD_TIMESTAMP` |
+| `BUILD_ID` | `r0` locally, `r<github.run_id>` in CI |
+| `APP_VERSION` | `YYMMDD-r<run>`; release CI overrides it with the Git tag |
+| `PLATFORMS` | `linux/amd64`, `linux/arm64` |
+| `PUBLISH` | Workflow guard for main/release publication; not a Bake variable |
+
+Each publication has four tags: `TAG`, `BUILD_ID`, `BUILD_DATE` and
+`BUILD_DATE-BUILD_ID`. Thus main publishes `edge`, `r<run>`, `YYMMDD` and
+`YYMMDD-r<run>`; a release replaces `edge` with its Git tag. The binary receives
+`APP_VERSION` through payday's version linker variable, and `page version`
+reports it. `BUILD_HASH` remains the full revision label on the image.
+
+Local builds accept the same environment variables:
+
+```sh
+TAG=dev BUILD_ID=r42 BUILD_HASH="$(git rev-parse HEAD)" \
+  docker buildx bake -f docker-bake.hcl app
+APP_VERSION=v1.2.3 TAG=v1.2.3 docker buildx bake -f docker-bake.hcl app
+```
+
+The Actions job summary records the published image index digest. Production
+manifests should pin `ghcr.io/lesomnus/page@sha256:...`. A PR's new image is
+available from the registry after a successful main or release publication.
 
 GitHub initially creates container packages as **private**, even for a public
 repository. After first publication, the package owner must change the page

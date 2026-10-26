@@ -1,8 +1,10 @@
 name: ci
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -46,3 +48,81 @@ jobs:
           done
           exit 1
       - run: ./scripts/check.sh
+
+  # Share the cr build contract: verification gates the image, and PRs build
+  # without publishing. main, release tags and manual runs on main can publish.
+  image:
+    needs: [check]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: edge
+      BUILD_HASH: ${{ github.sha }}
+      BUILD_ID: r${{ github.run_id }}
+      PUBLISH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build timestamp
+        run: echo "BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "APP_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build smoke image
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7
+        with:
+          files: docker-bake.hcl
+          targets: app
+          load: true
+          set: |
+            app.platform=linux/amd64
+            app.tags=page:smoke
+            app.cache-from=type=gha,scope=app
+            app.cache-to=type=gha,scope=app,mode=max
+      - name: Check stamped non-root read-only runtime
+        run: |
+          test "$(docker image inspect page:smoke --format '{{.Config.User}}')" = '65532:65532'
+          version=$(docker image inspect page:smoke --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+          actual=$(docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=32m \
+            --cap-drop ALL --security-opt no-new-privileges page:smoke version)
+          test "$actual" = "page $version"
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        id: build
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7
+        with:
+          files: docker-bake.hcl
+          targets: app
+          push: ${{ env.PUBLISH == 'true' }}
+          provenance: mode=max
+          sbom: true
+          set: |
+            app.cache-from=type=gha,scope=app
+            app.cache-to=type=gha,scope=app,mode=max
+      - name: Summarise
+        if: env.PUBLISH == 'true'
+        env:
+          METADATA: ${{ steps.build.outputs.metadata }}
+        run: |
+          set -eu
+          {
+            echo "| image | digest |"
+            echo "| ----- | ------ |"
+            printf '%s' "$METADATA" | jq -r '
+              to_entries[]
+              | select(.value["image.name"])
+              | "| \(.value["image.name"] | split(",")[0]) | `\(.value["containerimage.digest"])` |"
+            '
+          } >> "$GITHUB_STEP_SUMMARY"
