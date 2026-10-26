@@ -64,8 +64,8 @@ func TestMVPWithS3(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]any{"sha": head.Load().(string), "parents": []any{}})
 		case r.URL.Path == "/repos/acme/foo.app/branches":
 			json.NewEncoder(w).Encode([]any{map[string]any{"name": "main", "commit": map[string]string{"sha": head.Load().(string)}}})
-		case r.URL.Path == "/repos/acme/foo.app/contents/manifest.json":
-			io.WriteString(w, `{"schemaVersion":1,"publish":{"directory":"public"}}`)
+		case r.URL.Path == "/repos/acme/foo.app/contents/page.yaml":
+			io.WriteString(w, "schemaVersion: 1\npublish:\n  directory: public\n")
 		case strings.HasPrefix(r.URL.Path, "/repos/acme/foo.app/tarball/"):
 			sha := strings.TrimPrefix(r.URL.Path, "/repos/acme/foo.app/tarball/")
 			if b, ok := archives[sha]; ok {

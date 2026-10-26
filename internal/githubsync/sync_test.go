@@ -24,24 +24,25 @@ import (
 func sha(n int) string { return fmt.Sprintf("%040x", n) }
 
 type fakeGitHub struct {
-	mu            sync.Mutex
-	head          string
-	branches      map[string]string
-	tags          map[string]string
-	parents       map[string][]string
-	manifests     map[string]string
-	archives      map[string][]byte
-	archiveReads  int
-	pageFailure   bool
-	repeatedPage  bool
-	branchFailure bool
+	mu              sync.Mutex
+	head            string
+	branches        map[string]string
+	tags            map[string]string
+	parents         map[string][]string
+	manifests       map[string]string
+	legacyManifests map[string]string
+	archives        map[string][]byte
+	archiveReads    int
+	pageFailure     bool
+	repeatedPage    bool
+	branchFailure   bool
 }
 
 func fixture(t *testing.T) (*fakeGitHub, *httptest.Server) {
 	t.Helper()
 	f := &fakeGitHub{head: sha(2), branches: map[string]string{"main": sha(2), "feature/login": sha(4)}, tags: map[string]string{"v1.0": sha(1)}, parents: map[string][]string{sha(2): {sha(1), sha(9)}, sha(1): {}, sha(3): {sha(2)}, sha(4): {}, sha(9): {}}, manifests: map[string]string{}, archives: map[string][]byte{}}
 	for _, id := range []string{sha(1), sha(2), sha(3), sha(4), sha(9)} {
-		f.manifests[id] = `{"schemaVersion":1,"publish":{"directory":"public"}}`
+		f.manifests[id] = "schemaVersion: 1\npublish:\n  directory: public\n"
 		f.archives[id] = tarball(t, []tarEntry{{"public/index.html", "snapshot-" + id, tar.TypeReg}, {"public/assets/app.js", "console.log('ok')", tar.TypeReg}})
 	}
 	server := httptest.NewServer(f)
@@ -102,8 +103,15 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			c.Parents = append(c.Parents, commitID{p})
 		}
 		write(c)
-	case r.URL.Path == "/repos/acme/foo.app/contents/manifest.json":
+	case r.URL.Path == "/repos/acme/foo.app/contents/page.yaml":
 		manifest, ok := f.manifests[r.URL.Query().Get("ref")]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		io.WriteString(w, manifest)
+	case r.URL.Path == "/repos/acme/foo.app/contents/manifest.json":
+		manifest, ok := f.legacyManifests[r.URL.Query().Get("ref")]
 		if !ok {
 			http.NotFound(w, r)
 			return

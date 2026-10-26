@@ -82,7 +82,7 @@ func New(catalog *deploy.Catalog, cfg Config) (*Sync, error) {
 		return nil, errors.New("repository_pattern needs a capture group for the site name")
 	}
 	if cfg.ManifestPath == "" {
-		cfg.ManifestPath = "manifest.json"
+		cfg.ManifestPath = "page.yaml"
 	}
 	if !safePath(cfg.ManifestPath, false) {
 		return nil, errors.New("manifest_path must be a relative repository file")

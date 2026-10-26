@@ -40,7 +40,7 @@ github:
     token: ""
     repository_pattern: '^([a-z0-9][a-z0-9-]*)\.app$'
     branch: main
-    manifest_path: manifest.json
+    manifest_path: page.yaml
     poll_interval: 1m
     gc_grace: 24h
     asset_retention: 24h
@@ -74,18 +74,25 @@ AWS 자격 증명은 SDK의 표준 환경 변수·프로파일·실행 환경 �
 
 ```text
 acme/foo.app/
-  manifest.json
+  page.yaml
   public/
     index.html
     assets/app.js
 ```
 
-```json
-{"schemaVersion":1,"publish":{"directory":"public"}}
+```yaml
+schemaVersion: 1
+publish:
+  directory: public
 ```
 
-manifest의 파일명은 설정 가능하며 스키마 버전은 1이다. 게시 디렉터리는 레포 내
-상대 경로이고 `.`도 허용한다. manifest와 파일은 같은 전체 SHA에서 읽는다.
+대상 저장소의 배포 파일은 기본적으로 `page.yaml`이며, 호스팅 프로세스의 `--config` 파일과는 별개다.
+스키마 버전은 1이고 게시 디렉터리는 레포 내 상대 경로이며 `.`도 허용한다. 배포 파일과 게시 파일은
+같은 전체 SHA에서 읽는다. 알 수 없는 필드·중복 키·여러 YAML 문서·64 KiB 초과 파일은 거부한다.
+
+기본 경로에서 `page.yaml`이 404이면 과거 커밋의 preview를 유지하기 위해 이전 `manifest.json`을 읽는다.
+`page.yaml`이 존재하지만 잘못됐으면 이전 파일로 우회하지 않는다. `manifest_path`로 다른 경로를 지정하면
+그 파일만 읽는다. 새 배포 파일은 `page.yaml`을 사용한다.
 빌드를 실행하지 않으며 게시 디렉터리의 symlink·특수 파일·경로 탈출을 거부한다.
 
 시작 시 전체 목록을 탐색하고 polling으로 반복한다. 필요한 저장소·ref 목록과
@@ -106,13 +113,14 @@ sources/github-acme/sites/foo/releases/<release-id>/
 ```
 
 `owner`는 수명주기 소유자이며 `origin`은 소스 종류·레포 ID·커밋·게시 디렉터리다.
+Storage의 `manifest.json`은 서버가 작성하는 릴리스 메타데이터이며 앱의 `page.yaml`과 별개다.
 내부 release ID와 Git SHA는 다른 식별자다. 파일 metadata에는 MIME·크기·SHA-256을,
 사이트 객체에는 운영·preview 참조와 GC 대기 상태를 기록한다.
 
 ## pages.json 라우팅
 
-게시 디렉터리 루트에 선택적으로 `pages.json`을 둔다. 레포 루트의 배포 manifest와는
-별도 파일이다. 설정과 대상 파일 목록을 게시 전에 검증하며 완성된 릴리스에 고정한다.
+게시 디렉터리 루트의 `pages.json`은 선택적 라우팅 설정이며 저장소의 `page.yaml` 배포 파일과 별개다.
+설정과 대상 파일 목록을 게시 전에 검증하며 완성된 릴리스에 고정한다.
 알 수 없는 필드·지원하지 않는 버전·잘못된 대상·64 KiB를 넘는 설정은 게시를 거부한다.
 실패한 배포가 기존 운영 배포를 바꾸지 않는다.
 
