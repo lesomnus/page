@@ -115,8 +115,13 @@ func (s *Sync) archive(ctx context.Context, repo, sha, directory string) ([]depl
 			cleanup()
 		}
 	}()
-	tr := tar.NewReader(gz)
+	// Bound the complete expanded stream, including PAX metadata, directory
+	// headers and padding that tar.Reader consumes without returning as files.
+	expanded := &io.LimitedReader{R: gz, N: s.cfg.MaxArchiveBytes + 1}
+	tr := tar.NewReader(expanded)
 	files := []deploy.InputFile{}
+	// Sparse tar members may produce logical bytes without reading those bytes
+	// from gzip, so retain the aggregate logical-size limit as well.
 	var total int64
 	root := ""
 	for {
@@ -124,11 +129,23 @@ func (s *Sync) archive(ctx context.Context, repo, sha, directory string) ([]depl
 			return nil, nil, err
 		}
 		h, err := tr.Next()
+		if expanded.N <= 0 {
+			return nil, nil, errors.New("expanded archive exceeds limit")
+		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			return nil, nil, err
+		}
+		if h.Size < 0 || total > s.cfg.MaxArchiveBytes-h.Size || total+h.Size > s.cfg.MaxArchiveBytes-512 {
+			return nil, nil, errors.New("expanded archive exceeds limit")
+		}
+		total += h.Size + 512
+		// GitHub's git archive begins with a global PAX header carrying the
+		// commit ID. Its name is metadata, not a path in the repository tree.
+		if h.Typeflag == tar.TypeXGlobalHeader {
+			continue
 		}
 		name := strings.TrimSuffix(h.Name, "/")
 		if !safePath(name, false) {
@@ -147,10 +164,6 @@ func (s *Sync) archive(ctx context.Context, repo, sha, directory string) ([]depl
 			}
 			continue
 		}
-		if h.Size < 0 || total > s.cfg.MaxArchiveBytes-h.Size || total+h.Size > s.cfg.MaxArchiveBytes-512 {
-			return nil, nil, errors.New("expanded archive exceeds limit")
-		}
-		total += h.Size + 512
 		file := rel
 		if directory != "." {
 			var ok bool
@@ -181,6 +194,9 @@ func (s *Sync) archive(ctx context.Context, repo, sha, directory string) ([]depl
 		}
 		_, err = io.CopyN(f, tr, h.Size)
 		closeErr := f.Close()
+		if expanded.N <= 0 {
+			return nil, nil, errors.New("expanded archive exceeds limit")
+		}
 		if err != nil {
 			return nil, nil, err
 		}
