@@ -1,0 +1,22 @@
+listen: ":8080"
+api_listen: "127.0.0.1:50051"
+base_domain: example.com
+preview_style: flat
+refresh_interval: 5s
+storage:
+  bucket: page
+  prefix: page
+  region: us-east-1
+  endpoint: http://127.0.0.1:19090
+  path_style: true
+github:
+  - id: company-pages
+    owner: your-organization
+    owner_type: org
+    repository_pattern: '^([a-z0-9][a-z0-9-]*)\.app$'
+    manifest_path: manifest.json
+    poll_interval: 1m
+    recent_commits: 10
+    branches: [main, 'feature/*']
+    tags: ['v*']
+    gc_grace: 24h

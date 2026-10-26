@@ -1,0 +1,12 @@
+.gen/
+dist/
+node_modules/
+*.db
+*-checkpoints.pem
+
+# Local build and development output.
+/page
+*.db-shm
+*.db-wal
+.env
+.env.local

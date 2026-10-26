@@ -1,0 +1,27 @@
+edition = "2023";
+package app;
+import "google/protobuf/timestamp.proto";
+import "orm.proto";
+import "payday.proto";
+option features.field_presence = IMPLICIT;
+option go_package = "github.com/lesomnus/page";
+// An immutable static snapshot published in object storage.
+message Deployment {
+  bytes id = 1 [(orm.field) = {type: TYPE_UUID, key: true, default: ""}];
+  string alias = 4;
+  string source_id = 8;
+  string site_alias = 9;
+  string revision = 10;
+  string source_kind = 11;
+  string release_id = 12;
+
+  google.protobuf.Timestamp date_created = 15 [(orm.field) = {immutable: true, default: ""}];
+  option (orm.message) = {rpc: {get: {}}};
+  option (payday.entity) = {
+    domain: 9
+    global: {}
+    erase: {hard: {}}
+    trail: {off: {why: "Read-only object-storage projection; source sync owns publication and origin metadata."}}
+    list: {order: [{field: {name: "id"}}], by: [{name: "ref"}], size: 20, max: 100}
+  };
+}

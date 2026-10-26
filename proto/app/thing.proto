@@ -1,0 +1,130 @@
+edition = "2023";
+
+package app;
+
+import "app/payday/tenant.proto";
+import "google/protobuf/timestamp.proto";
+import "orm.proto";
+import "payday.proto";
+
+option features.field_presence = IMPLICIT;
+option go_package = "github.com/lesomnus/page";
+
+// Thing is the entity this app starts with. Rename it, or delete it and write
+// your own with `pd entity add`.
+//
+// What is worth reading here is the option at the bottom. Everything payday
+// generates comes out of it: the domain byte every identifier of a Thing
+// carries, the predicate that narrows every read to the tenants a caller may
+// see, the List RPC and its implementation, and the Watch.
+message Thing {
+  bytes id = 1 [(orm.field) = {
+    type: TYPE_UUID
+    key: true
+    default: ""
+  }];
+
+  Tenant tenant = 2 [(orm.edge) = {immutable: true}];
+
+  // The name a person writes this as. Every write of it is folded and checked
+  // on the way in, so "  Arm-01 " and "arm-01" are one row and "Not A Name" is
+  // refused with the field it was in.
+  string alias = 4;
+
+  // 5 is the name and 6 is the description, in this entity and in every one
+  // payday ships. An entity that does not want one of them leaves the number
+  // empty rather than spending it on something else, which is what keeps
+  // `header.Of` able to read any of them.
+  //
+  // 3 is yours: a set smaller than a tenant, if this app has one. payday
+  // leaves it open and will not spend it -- see `docs/schema.md`.
+  string desc = 6;
+
+  // Erased softly, which is what saying nothing about erasure means: the row is
+  // stamped and stays, so it cannot be read or changed, its alias comes free
+  // again, and the trail can still say what it held. Delete it and say
+  // `erase: {hard: {}}` if losing the row is the point -- a table of readings
+  // cannot be one nothing may ever be removed from.
+  google.protobuf.Timestamp date_erased = 14 [(orm.field) = {erased: {}}];
+
+  // Stamped on every write and refused to a patch document, so it is a version
+  // and not a field. Generation refuses a `watch:` without one: a watch sends
+  // state, so two answers about one row have to be orderable or a late one
+  // erases an early one that was newer.
+  google.protobuf.Timestamp date_updated = 13 [(orm.field) = {version: {}}];
+
+  google.protobuf.Timestamp date_created = 15 [(orm.field) = {
+    immutable: true
+    default: ""
+  }];
+
+  option (orm.message) = {
+    rpc: {crud: true}
+    indexes: [
+      // The order a List reads in, the tenant first since every read is
+      // narrowed to one. Generation warns without it, because the read it
+      // names would scan the table -- every tenant's rows -- and sort what it
+      // found.
+      {
+        name: "page"
+        refs: [
+          {
+            name: "tenant"
+            number: 2
+          },
+          {
+            name: "date_created"
+            number: 15
+          },
+          {
+            name: "id"
+            number: 1
+          }
+        ]
+      },
+      {
+        name: "slug"
+        refs: [
+          {
+            name: "alias"
+            number: 4
+          },
+          {
+            name: "tenant"
+            number: 2
+          }
+        ]
+        unique: true
+      }
+    ]
+  };
+  option (payday.entity) = {
+    domain: 7
+
+    // Nothing about tenancy, which is the declaration: behind the wall, by the
+    // edge called `tenant`. The other two are written out when they are meant --
+    // `tenant: {}` for the entity that **is** the tenant, and `global: {}` for
+    // rows that are not behind it.
+    //
+    // The ordinary case is the silent one because of how the two failures
+    // differ: assuming a wall hides every row, which is noticed within minutes,
+    // and assuming none shows every row to everybody, which is noticed by
+    // whoever it happens to.
+
+    list: {
+      // The order has to end in the key. A cursor cannot tell apart two rows
+      // equal in every column of the order, so the page after the first of them
+      // repeats the second or skips it.
+      order: [{field: {name: "date_created"}}, {field: {name: "id"}}]
+
+      // What a caller may filter by. "ref" is naming a row outright, and a
+      // watch is refused without it.
+      by: [{name: "ref"}]
+
+      size: 20
+      max: 100
+    }
+
+    watch: {}
+  };
+}

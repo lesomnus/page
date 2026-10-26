@@ -1,0 +1,14 @@
+listen: ":8080"
+api_listen: "127.0.0.1:50051"
+base_domain: example.com
+preview_style: flat
+refresh_interval: 5s
+storage:
+  bucket: page
+  prefix: page
+  region: us-east-1
+  endpoint: http://127.0.0.1:19090
+  path_style: true
+# Run `page serve` independently, or configure sources and use `page run`.
+# Tokens default to GITHUB_TOKEN; per-source token: ${SOURCE_TOKEN} also works.
+github: []

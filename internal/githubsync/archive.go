@@ -1,0 +1,212 @@
+package githubsync
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/lesomnus/page/internal/deploy"
+	"github.com/lesomnus/page/internal/storage"
+)
+
+type manifest struct {
+	SchemaVersion int `json:"schemaVersion"`
+	Publish       struct {
+		Directory string `json:"directory"`
+	} `json:"publish"`
+}
+
+func safePath(p string, root bool) bool {
+	if root && p == "." {
+		return true
+	}
+	if p == "" || strings.HasPrefix(p, "/") || !utf8.ValidString(p) || strings.ContainsAny(p, "\\\x00\r\n") || strings.ContainsAny(p, "\t") {
+		return false
+	}
+	for _, part := range strings.Split(p, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return path.Clean(p) == p
+}
+
+func (s *Sync) publish(ctx context.Context, repo repository, site, sha string) (*deploy.Release, error) {
+	endpoint := repoEndpoint(repo.FullName) + "/contents/" + escapePath(s.cfg.ManifestPath) + "?ref=" + url.QueryEscape(sha)
+	resp, err := s.request(ctx, endpoint, "application/vnd.github.raw+json")
+	if err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) && ae.status == 404 {
+			return nil, errNoManifest
+		}
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 65536 {
+		return nil, errors.New("deployment manifest exceeds 64 KiB")
+	}
+	var m manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("decode manifest: %w", err)
+	}
+	if m.SchemaVersion != 1 || !safePath(m.Publish.Directory, true) {
+		return nil, errors.New("manifest needs schemaVersion 1 and a safe publish.directory")
+	}
+	origin := deploy.Origin{Kind: "git", RepositoryID: strconv.FormatInt(repo.ID, 10), Repository: repo.FullName, Revision: sha, Directory: m.Publish.Directory}
+	id := deploy.ReleaseID(s.cfg.ID, site, origin)
+	if r, err := s.cat.GetRelease(ctx, s.cfg.ID, site, id); err == nil {
+		return r, nil
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return nil, err
+	}
+	files, cleanup, err := s.archive(ctx, repo.FullName, sha, m.Publish.Directory)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	return s.cat.Publish(ctx, site, s.cfg.ID, origin, files)
+}
+
+func escapePath(p string) string {
+	parts := strings.Split(p, "/")
+	for i := range parts {
+		parts[i] = url.PathEscape(parts[i])
+	}
+	return strings.Join(parts, "/")
+}
+
+func (s *Sync) archive(ctx context.Context, repo, sha, directory string) ([]deploy.InputFile, func(), error) {
+	resp, err := s.request(ctx, repoEndpoint(repo)+"/tarball/"+sha, "application/vnd.github+json")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	limited := &io.LimitedReader{R: resp.Body, N: s.cfg.MaxArchiveBytes + 1}
+	gz, err := gzip.NewReader(limited)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer gz.Close()
+	dir, err := os.MkdirTemp("", "page-github-")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() { os.RemoveAll(dir) }
+	failed := true
+	defer func() {
+		if failed {
+			cleanup()
+		}
+	}()
+	tr := tar.NewReader(gz)
+	files := []deploy.InputFile{}
+	var total int64
+	root := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		name := strings.TrimSuffix(h.Name, "/")
+		if !safePath(name, false) {
+			return nil, nil, fmt.Errorf("unsafe archive path %q", h.Name)
+		}
+		top, rel, hasSlash := strings.Cut(name, "/")
+		if root == "" {
+			root = top
+		}
+		if root != top {
+			return nil, nil, errors.New("archive has multiple roots")
+		}
+		if !hasSlash {
+			if h.Typeflag != tar.TypeDir {
+				return nil, nil, errors.New("archive has no repository root")
+			}
+			continue
+		}
+		if h.Size < 0 || total > s.cfg.MaxArchiveBytes-h.Size || total+h.Size > s.cfg.MaxArchiveBytes-512 {
+			return nil, nil, errors.New("expanded archive exceeds limit")
+		}
+		total += h.Size + 512
+		file := rel
+		if directory != "." {
+			var ok bool
+			file, ok = strings.CutPrefix(rel, directory+"/")
+			if !ok {
+				continue
+			}
+		}
+		if h.Typeflag == tar.TypeDir {
+			continue
+		}
+		if h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeRegA {
+			return nil, nil, fmt.Errorf("publish path %q is not a regular file", rel)
+		}
+		if !safePath(file, false) || h.Size > s.cfg.MaxFileBytes {
+			return nil, nil, fmt.Errorf("invalid or oversized publish file %q", file)
+		}
+		if len(files) >= s.cfg.MaxFiles {
+			return nil, nil, errors.New("too many publish files")
+		}
+		destination := filepath.Join(dir, filepath.FromSlash(file))
+		if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+			return nil, nil, err
+		}
+		f, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, nil, err
+		}
+		_, err = io.CopyN(f, tr, h.Size)
+		closeErr := f.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+		if closeErr != nil {
+			return nil, nil, closeErr
+		}
+		contentType := mime.TypeByExtension(path.Ext(file))
+		if contentType == "" {
+			f, err := os.Open(destination)
+			if err != nil {
+				return nil, nil, err
+			}
+			var sample [512]byte
+			n, _ := f.Read(sample[:])
+			f.Close()
+			contentType = http.DetectContentType(sample[:n])
+		}
+		filename := destination
+		files = append(files, deploy.InputFile{Path: file, Size: h.Size, ContentType: contentType, Open: func() (io.ReadCloser, error) { return os.Open(filename) }})
+	}
+	if limited.N <= 0 {
+		return nil, nil, errors.New("compressed archive exceeds limit")
+	}
+	if len(files) == 0 {
+		return nil, nil, errors.New("publish directory contains no regular files")
+	}
+	failed = false
+	return files, cleanup, nil
+}

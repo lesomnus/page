@@ -1,0 +1,15 @@
+services:
+  s3:
+    # Development-only S3 API implementation; see docs/mvp.md.
+    image: adobe/s3mock@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: page,page-storage-test
+      COM_ADOBE_TESTING_S3MOCK_STORE_ROOT: /s3mockroot
+      COM_ADOBE_TESTING_S3MOCK_STORE_RETAIN_FILES_ON_EXIT: "true"
+    ports:
+      - "${PAGE_S3_BIND:-127.0.0.1}:${PAGE_S3_PORT:-19090}:9090"
+    volumes:
+      - s3-data:/s3mockroot
+
+volumes:
+  s3-data:

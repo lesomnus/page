@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-26.04
+    services:
+      s3:
+        image: adobe/s3mock@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
+        env:
+          COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: page,page-storage-test
+        ports:
+          - 9090:9090
+    env:
+      PAGE_TEST_S3_ENDPOINT: http://127.0.0.1:9090
+      PAGE_TEST_S3_BUCKET: page-storage-test
+      AWS_ACCESS_KEY_ID: page-dev
+      AWS_SECRET_ACCESS_KEY: page-dev-secret
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci --prefix ts
+      - name: Wait for the S3 API
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:9090/favicon.ico >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+      - run: ./scripts/check.sh

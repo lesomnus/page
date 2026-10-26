@@ -1,0 +1,26 @@
+edition = "2023";
+package app;
+import "google/protobuf/timestamp.proto";
+import "orm.proto";
+import "payday.proto";
+option features.field_presence = IMPLICIT;
+option go_package = "github.com/lesomnus/page";
+// A published site owned by one source sync.
+message Site {
+  bytes id = 1 [(orm.field) = {type: TYPE_UUID, key: true, default: ""}];
+  string alias = 4;
+  string source_id = 8;
+  string repository_id = 9;
+  string repository = 10;
+  string production_release = 11;
+
+  google.protobuf.Timestamp date_created = 15 [(orm.field) = {immutable: true, default: ""}];
+  option (orm.message) = {rpc: {get: {}}};
+  option (payday.entity) = {
+    domain: 8
+    global: {}
+    erase: {hard: {}}
+    trail: {off: {why: "Read-only object-storage projection; source sync owns publication and origin metadata."}}
+    list: {order: [{field: {name: "id"}}], by: [{name: "ref"}], size: 20, max: 100}
+  };
+}
