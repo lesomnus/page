@@ -24,12 +24,14 @@ export AWS_REGION=us-east-1
 export GITHUB_TOKEN=your-read-only-github-token
 ```
 
-`page.yaml`의 `github` 목록에 [설정 예시](docs/mvp.md)의 소스를 추가하고 owner를
+호스팅 서버 설정 `page.yaml`의 `github` 목록에 [설정 예시](docs/mvp.md)의 소스를 추가하고 owner를
 자신의 조직에 맞춘다. 대상 저장소에는
-아래 manifest와 `public/index.html` 등 이미 빌드된 파일을 커밋한다.
+다음 `page.yaml`과 `public/index.html` 등 이미 빌드된 파일을 커밋한다.
 
-```json
-{"schemaVersion":1,"publish":{"directory":"public"}}
+```yaml
+schemaVersion: 1
+publish:
+  directory: public
 ```
 
 ```sh

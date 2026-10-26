@@ -14,7 +14,7 @@ github:
     owner: your-organization
     owner_type: org
     repository_pattern: '^([a-z0-9][a-z0-9-]*)\.app$'
-    manifest_path: manifest.json
+    manifest_path: page.yaml
     poll_interval: 1m
     recent_commits: 10
     branches: [main, 'feature/*']

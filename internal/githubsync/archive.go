@@ -2,9 +2,9 @@ package githubsync
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,14 +20,43 @@ import (
 
 	"github.com/lesomnus/page/internal/deploy"
 	"github.com/lesomnus/page/internal/storage"
+	"gopkg.in/yaml.v3"
 )
 
 type manifest struct {
-	SchemaVersion int `json:"schemaVersion"`
+	SchemaVersion manifestVersion `yaml:"schemaVersion"`
 	Publish       struct {
-		Directory string `json:"directory"`
-	} `json:"publish"`
+		Directory string `yaml:"directory"`
+	} `yaml:"publish"`
 }
+
+// Keep the integer schema contract: YAML's usual scalar coercions would turn
+// schemaVersion: 1.5 into 1 or accept the quoted string "1".
+type manifestVersion int
+
+func (v *manifestVersion) UnmarshalYAML(n *yaml.Node) error {
+	if n.Tag != "!!int" {
+		return errors.New("schemaVersion must be an integer")
+	}
+	var parsed int
+	if err := n.Decode(&parsed); err != nil {
+		return err
+	}
+	*v = manifestVersion(parsed)
+	return nil
+}
+
+type manifestDecodeError struct {
+	filename string
+	cause    error
+}
+
+// YAML type errors can quote scalar contents from a private repository. Keep
+// that diagnostic available to callers without rendering it into sync logs.
+func (e *manifestDecodeError) Error() string {
+	return "decode " + e.filename + ": invalid deployment YAML"
+}
+func (e *manifestDecodeError) Unwrap() error { return e.cause }
 
 func safePath(p string, root bool) bool {
 	if root && p == "." {
@@ -44,30 +73,53 @@ func safePath(p string, root bool) bool {
 	return path.Clean(p) == p
 }
 
-func (s *Sync) publish(ctx context.Context, repo repository, site, sha string) (*deploy.Release, error) {
-	endpoint := repoEndpoint(repo.FullName) + "/contents/" + escapePath(s.cfg.ManifestPath) + "?ref=" + url.QueryEscape(sha)
-	resp, err := s.request(ctx, endpoint, "application/vnd.github.raw+json")
-	if err != nil {
-		var ae *apiError
-		if errors.As(err, &ae) && ae.status == 404 {
-			return nil, errNoManifest
+func (s *Sync) deploymentManifest(ctx context.Context, repo repository, sha string) (manifest, error) {
+	paths := []string{s.cfg.ManifestPath}
+	if s.cfg.ManifestPath == "page.yaml" {
+		// Immutable older commits still carry the previous deployment file.
+		// A present but invalid page.yaml never falls back to another file.
+		paths = append(paths, "manifest.json")
+	}
+	for _, filename := range paths {
+		endpoint := repoEndpoint(repo.FullName) + "/contents/" + escapePath(filename) + "?ref=" + url.QueryEscape(sha)
+		resp, err := s.request(ctx, endpoint, "application/vnd.github.raw+json")
+		if err != nil {
+			var ae *apiError
+			if errors.As(err, &ae) && ae.status == 404 {
+				continue
+			}
+			return manifest{}, err
 		}
-		return nil, err
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
+		resp.Body.Close()
+		if err != nil {
+			return manifest{}, err
+		}
+		if len(data) > 65536 {
+			return manifest{}, errors.New("deployment manifest exceeds 64 KiB")
+		}
+		var m manifest
+		decoder := yaml.NewDecoder(bytes.NewReader(data))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&m); err != nil {
+			return manifest{}, &manifestDecodeError{filename, err}
+		}
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
+			return manifest{}, fmt.Errorf("%s must contain one YAML document", filename)
+		}
+		if m.SchemaVersion != 1 || !safePath(m.Publish.Directory, true) {
+			return manifest{}, errors.New("manifest needs schemaVersion 1 and a safe publish.directory")
+		}
+		return m, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
-	resp.Body.Close()
+	return manifest{}, errNoManifest
+}
+
+func (s *Sync) publish(ctx context.Context, repo repository, site, sha string) (*deploy.Release, error) {
+	m, err := s.deploymentManifest(ctx, repo, sha)
 	if err != nil {
 		return nil, err
-	}
-	if len(data) > 65536 {
-		return nil, errors.New("deployment manifest exceeds 64 KiB")
-	}
-	var m manifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
-	}
-	if m.SchemaVersion != 1 || !safePath(m.Publish.Directory, true) {
-		return nil, errors.New("manifest needs schemaVersion 1 and a safe publish.directory")
 	}
 	origin := deploy.Origin{Kind: "git", RepositoryID: strconv.FormatInt(repo.ID, 10), Repository: repo.FullName, Revision: sha, Directory: m.Publish.Directory}
 	id := deploy.ReleaseID(s.cfg.ID, site, origin)
