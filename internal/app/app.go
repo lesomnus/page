@@ -20,6 +20,7 @@ import (
 	"github.com/lesomnus/page/internal/githubsync"
 	"github.com/lesomnus/page/internal/serving"
 	"github.com/lesomnus/page/internal/storage"
+	"github.com/lesomnus/payday/version"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -92,7 +93,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		return runRoutes(args[1:], out, errOut)
 	}
 	if command == "version" {
-		fmt.Fprintln(out, "page (payday 7ae6f76)")
+		fmt.Fprintln(out, "page "+version.Get().String())
 		return nil
 	}
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)

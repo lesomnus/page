@@ -1,0 +1,9 @@
+# Only Go source required by cmd/page enters the build context.
+**
+!go.mod
+!go.sum
+!*.go
+!cmd/
+!cmd/**
+!internal/
+!internal/**
