@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -41,10 +42,55 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("GitHub %s returned HTTP %d", e.endpoint, e.status)
 }
 
+// A private archive redirects to a short-lived signed URL. http.Client errors
+// can contain that URL, including credentials, so only render the original API
+// path and a safe error class. Keep the cause available for cancellation and
+// network error checks without including its arbitrary text in sync logs.
+type requestError struct {
+	endpoint string
+	cause    error
+}
+
+func (e *requestError) Error() string {
+	cause := e.cause
+	for {
+		u, ok := cause.(*url.Error)
+		if !ok {
+			break
+		}
+		cause = u.Err
+	}
+	detail := fmt.Sprintf("transport error %T", cause)
+	var network net.Error
+	switch {
+	case errors.Is(e.cause, context.Canceled):
+		detail = "context canceled"
+	case errors.Is(e.cause, context.DeadlineExceeded):
+		detail = "context deadline exceeded"
+	case errors.As(e.cause, &network) && network.Timeout():
+		detail = "timeout"
+	case errors.Is(e.cause, io.ErrUnexpectedEOF):
+		detail = "unexpected EOF"
+	case errors.Is(e.cause, io.EOF):
+		detail = "EOF"
+	}
+	return fmt.Sprintf("GitHub %s request failed: %s", e.endpoint, detail)
+}
+
+func (e *requestError) Unwrap() error { return e.cause }
+
+func apiPath(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "<invalid endpoint>"
+	}
+	return u.EscapedPath()
+}
+
 func (s *Sync) request(ctx context.Context, endpoint, accept string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.APIURL+endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, &requestError{apiPath(endpoint), err}
 	}
 	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", "lesomnus-page")
@@ -54,11 +100,11 @@ func (s *Sync) request(ctx context.Context, endpoint, accept string) (*http.Resp
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &requestError{apiPath(endpoint), err}
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, &apiError{resp.StatusCode, endpoint}
+		return nil, &apiError{resp.StatusCode, apiPath(endpoint)}
 	}
 	return resp, nil
 }
