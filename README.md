@@ -44,6 +44,8 @@ S3Mock 검증은 실제 AWS의 IAM·장애·일관성 검증을 대신하지 않
 
 ## 실행 모드
 
+컨테이너 빌드·이미지 발행과 Kubernetes 실행 조건은 [컨테이너 배포](docs/containers.md)를 참고한다.
+
 ```sh
 go run ./cmd/page serve             # 게시 상태 읽기 + HTTP/읽기 전용 gRPC
 go run ./cmd/page sync              # GitHub 발견·게시·보존·GC polling
