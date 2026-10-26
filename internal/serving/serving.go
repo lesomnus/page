@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/lesomnus/page/internal/deploy"
+	"github.com/lesomnus/page/internal/routes"
 	"github.com/lesomnus/page/internal/storage"
 )
 
@@ -28,7 +30,16 @@ type Config struct {
 	RefreshInterval time.Duration `yaml:"refresh_interval"`
 }
 
-type route struct{ release *deploy.Release }
+type retainedAsset struct {
+	release *deploy.Release
+	engine  *routes.Engine
+	expires time.Time
+}
+type route struct {
+	release *deploy.Release
+	engine  *routes.Engine
+	assets  []retainedAsset
+}
 type snapshot struct{ routes map[string]route }
 
 type Handler struct {
@@ -36,6 +47,7 @@ type Handler struct {
 	config  Config
 	refresh sync.Mutex
 	current atomic.Pointer[snapshot]
+	now     func() time.Time
 }
 
 func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
@@ -58,7 +70,7 @@ func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
 	if config.RefreshInterval < 0 {
 		return nil, errors.New("serving: refresh_interval must be positive")
 	}
-	return &Handler{catalog: catalog, config: config}, nil
+	return &Handler{catalog: catalog, config: config, now: time.Now}, nil
 }
 
 // Refresh replaces the complete routing snapshot only after every referenced
@@ -71,11 +83,58 @@ func (h *Handler) Refresh(ctx context.Context) error {
 		return fmt.Errorf("serving: list sites: %w", err)
 	}
 	next := &snapshot{routes: make(map[string]route)}
+	now := h.now()
 	for _, site := range sites {
 		if !deploy.ValidName(site.Name) {
 			return errors.New("serving: invalid site name")
 		}
-		loaded := make(map[string]*deploy.Release)
+		if site.Disabled {
+			continue
+		}
+		loaded := make(map[string]route)
+		load := func(id string) (route, error) {
+			if cached, ok := loaded[id]; ok {
+				return cached, nil
+			}
+			rel, e := h.catalog.GetRelease(ctx, site.Owner, site.Name, id)
+			if e != nil {
+				return route{}, fmt.Errorf("serving: load release %s: %w", id, e)
+			}
+			if !rel.Complete || rel.Site != site.Name || rel.Owner != site.Owner || rel.Origin.RepositoryID != site.RepositoryID {
+				return route{}, errors.New("serving: invalid release ownership or completion")
+			}
+			files := make(map[string]bool, len(rel.Files))
+			for path := range rel.Files {
+				files[path] = true
+			}
+			engine, e := routes.Compile(rel.Pages, files)
+			if e != nil {
+				return route{}, fmt.Errorf("serving: compile release %s: %w", id, e)
+			}
+			result := route{release: rel, engine: engine}
+			loaded[id] = result
+			return result, nil
+		}
+		retained := []retainedAsset{}
+		if site.Production != "" {
+			for id, expiry := range site.AssetReleases {
+				if !now.Before(expiry) || id == site.Production {
+					continue
+				}
+				old, e := load(id)
+				if e != nil {
+					return e
+				}
+				retained = append(retained, retainedAsset{release: old.release, engine: old.engine, expires: expiry})
+			}
+			sort.Slice(retained, func(i, j int) bool {
+				left, right := retained[i].release, retained[j].release
+				if !left.CreatedAt.Equal(right.CreatedAt) {
+					return left.CreatedAt.After(right.CreatedAt)
+				}
+				return left.ID < right.ID
+			})
+		}
 		add := func(token, id, revision string) error {
 			if id == "" {
 				return nil
@@ -83,20 +142,15 @@ func (h *Handler) Refresh(ctx context.Context) error {
 			if token != "" && !deploy.ValidName(token) {
 				return errors.New("serving: invalid preview token")
 			}
-			r := loaded[id]
-			if r == nil {
-				var e error
-				r, e = h.catalog.GetRelease(ctx, site.Owner, site.Name, id)
-				if e != nil {
-					return fmt.Errorf("serving: load release %s: %w", id, e)
-				}
-				if !r.Complete || r.Site != site.Name || r.Owner != site.Owner || r.Origin.RepositoryID != site.RepositoryID {
-					return errors.New("serving: invalid release ownership or completion")
-				}
-				loaded[id] = r
+			result, e := load(id)
+			if e != nil {
+				return e
 			}
-			if revision != "" && revision != r.Origin.Revision {
+			if revision != "" && revision != result.release.Origin.Revision {
 				return errors.New("serving: preview revision does not match release")
+			}
+			if token == "" {
+				result.assets = retained
 			}
 			host := deploy.Host(h.config.BaseDomain, h.config.PreviewStyle, site.Name, token)
 			if !validHostname(host) {
@@ -105,7 +159,7 @@ func (h *Handler) Refresh(ctx context.Context) error {
 			if _, exists := next.routes[host]; exists {
 				return errors.New("serving: duplicate hostname")
 			}
-			next.routes[host] = route{release: r}
+			next.routes[host] = result
 			return nil
 		}
 		if err := add("", site.Production, ""); err != nil {
@@ -169,33 +223,44 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	rel := route.release
-	file, ok := rel.Files[p]
-	if !ok {
-		index := strings.TrimSuffix(p, "/")
-		if index != "" {
-			index += "/"
-		}
-		index += "index.html"
-		file, ok = rel.Files[index]
-		if ok {
-			if !strings.HasSuffix(r.URL.Path, "/") {
-				target := url.URL{Path: r.URL.Path + "/", RawQuery: r.URL.RawQuery}
-				http.Redirect(w, r, target.String(), http.StatusMovedPermanently)
-				return
-			}
-			p = index
-		}
-	}
-	if !ok {
-		http.NotFound(w, r)
+	decision := route.engine.Resolve("/"+p, isNavigation(r, p))
+	if decision.Status == http.StatusBadRequest {
+		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	key := deploy.FileKey(rel, p)
+	rel := route.release
+	if (decision.Action == routes.ActionNotFound || decision.Action == routes.ActionFallback) && p != "" {
+		if old, file, ok := h.previousAsset(route, p); ok {
+			rel = old
+			decision.Path = file.Path
+			decision.Status = http.StatusOK
+			decision.Action = routes.ActionFile
+		}
+	}
+	if decision.Redirect != "" {
+		target, e := url.Parse(decision.Redirect)
+		if e != nil {
+			http.Error(w, "invalid redirect", http.StatusInternalServerError)
+			return
+		}
+		if target.RawQuery == "" {
+			target.RawQuery = r.URL.RawQuery
+		}
+		applyHeaders(w, decision.Headers)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		http.Redirect(w, r, target.String(), decision.Status)
+		return
+	}
+	file, exists := rel.Files[decision.Path]
+	if !exists || decision.Path == "" {
+		h.notFound(w, r, decision.Headers)
+		return
+	}
+	key := deploy.FileKey(rel, decision.Path)
 	info, err := h.catalog.Store.Stat(r.Context(), key)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
+			h.notFound(w, r, decision.Headers)
 		} else {
 			http.Error(w, "object unavailable", http.StatusServiceUnavailable)
 		}
@@ -207,20 +272,104 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	contentType := file.ContentType
 	if contentType == "" {
-		contentType = mime.TypeByExtension(path.Ext(p))
+		contentType = mime.TypeByExtension(path.Ext(decision.Path))
 	}
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-cache")
-	if len(file.SHA256) == 64 {
+	if decision.Status == http.StatusOK && len(file.SHA256) == 64 {
 		w.Header().Set("ETag", `"`+file.SHA256+`"`)
 	}
+	applyHeaders(w, decision.Headers)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	reader := &objectReader{ctx: r.Context(), store: h.catalog.Store, key: key, size: file.Size}
 	defer reader.Close()
-	http.ServeContent(w, r, path.Base(p), rel.CreatedAt, reader)
+	if decision.Status == http.StatusNotFound {
+		// Error documents retain their error status and do not turn into conditional
+		// 304 or Range responses merely because they have a static file body.
+		w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
+		w.WriteHeader(http.StatusNotFound)
+		if r.Method != http.MethodHead {
+			if _, err := io.CopyN(w, reader, file.Size); err != nil {
+				slog.ErrorContext(r.Context(), "serve error document", slog.Any("err", err))
+			}
+		}
+		return
+	}
+	http.ServeContent(w, r, path.Base(decision.Path), rel.CreatedAt, reader)
+}
+
+func applyHeaders(w http.ResponseWriter, headers map[string]string) {
+	for name, value := range headers {
+		w.Header().Set(name, value)
+	}
+}
+
+func (h *Handler) notFound(w http.ResponseWriter, r *http.Request, headers map[string]string) {
+	const body = "404 page not found\n"
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	applyHeaders(w, headers)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusNotFound)
+	if r.Method != http.MethodHead {
+		io.WriteString(w, body)
+	}
+}
+
+func (h *Handler) previousAsset(current route, p string) (*deploy.Release, deploy.File, bool) {
+	now := h.now()
+	for _, old := range current.assets {
+		if !now.Before(old.expires) || !old.engine.Immutable(p) {
+			continue
+		}
+		file, ok := old.release.Files[p]
+		if !ok || htmlAsset(file) || p == "pages.json" {
+			continue
+		}
+		return old.release, file, true
+	}
+	return nil, deploy.File{}, false
+}
+
+func htmlAsset(file deploy.File) bool {
+	media, _, _ := mime.ParseMediaType(file.ContentType)
+	ext := strings.ToLower(path.Ext(file.Path))
+	return strings.EqualFold(media, "text/html") || strings.EqualFold(media, "application/xhtml+xml") || ext == ".html" || ext == ".htm" || ext == ".xhtml"
+}
+
+func isNavigation(r *http.Request, p string) bool {
+	destination := r.Header.Get("Sec-Fetch-Dest")
+	if destination != "" && destination != "document" && destination != "iframe" && destination != "empty" {
+		return false
+	}
+	accept := r.Header.Get("Accept")
+	simplePath := path.Ext(p) == "" || strings.EqualFold(path.Ext(p), ".html") || strings.EqualFold(path.Ext(p), ".htm")
+	if accept == "" {
+		return simplePath
+	}
+	for _, item := range strings.Split(accept, ",") {
+		media, params, err := mime.ParseMediaType(strings.TrimSpace(item))
+		if err != nil {
+			continue
+		}
+		if q, ok := params["q"]; ok {
+			value, err := strconv.ParseFloat(q, 64)
+			if err != nil || value <= 0 {
+				continue
+			}
+		}
+		if strings.EqualFold(media, "text/html") || strings.EqualFold(media, "application/xhtml+xml") {
+			return true
+		}
+		if (media == "*/*" || strings.EqualFold(media, "text/*")) && simplePath {
+			return true
+		}
+	}
+	return false
 }
 
 func validHostname(host string) bool {

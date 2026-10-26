@@ -213,7 +213,7 @@ func TestInvalidPathsAndMethods(t *testing.T) {
 	r := publish(t, c, "foo", "first", map[string]string{"index.html": "safe"})
 	save(t, c, r, nil)
 	h := handler(t, c, "")
-	for _, p := range []string{"/../index.html", "/%2e%2e/index.html", "/%252e%252e/index.html", "/a%2f..%2findex.html", "/a%5cindex.html", "//index.html", "/a/./index.html", "/%00"} {
+	for _, p := range []string{"/../index.html", "/%2e%2e/index.html", "/%252e%252e/index.html", "/a%2f..%2findex.html", "/a%5cindex.html", "//index.html", "/a/./index.html", "/%00", "/%09", "/%1f", "/%7f", "/%ff"} {
 		w := request(h, "GET", "foo.example.com", p, nil)
 		if w.Code != 400 {
 			t.Fatalf("path %q returned %d", p, w.Code)

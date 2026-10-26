@@ -73,7 +73,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 	root.SetOutput(errOut)
 	configPath := root.String("config", "page.yaml", "configuration file")
 	root.Usage = func() {
-		fmt.Fprintln(out, "Usage: page [--config FILE] <serve|sync|run|status|config|version> [--config FILE] [--once]")
+		fmt.Fprintln(out, "Usage: page [--config FILE] <serve|sync|run|status|config|version|routes|releases|promote|rollback|pin|pause|resume|remove> [arguments]")
 		fmt.Fprintln(out, "serve: S3-backed HTTP and read-only payday gRPC API; sync: GitHub polling; run: both")
 	}
 	if e := root.Parse(args); e != nil {
@@ -88,6 +88,9 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		return nil
 	}
 	command := args[0]
+	if command == "routes" {
+		return runRoutes(args[1:], out, errOut)
+	}
 	if command == "version" {
 		fmt.Fprintln(out, "page (payday 7ae6f76)")
 		return nil
@@ -96,20 +99,29 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 	fs.SetOutput(errOut)
 	fs.StringVar(configPath, "config", *configPath, "configuration file")
 	once := fs.Bool("once", false, "perform one source synchronization pass")
-	if e := fs.Parse(args[1:]); e != nil {
+	source := fs.String("source", "", "assert the owning source configuration ID")
+	wait := fs.Duration("wait", 0, "wait for the owner sync to apply deployment control")
+	ordered, e := orderedFlags(args[1:])
+	if e != nil {
+		return e
+	}
+	if e := fs.Parse(ordered); e != nil {
 		if errors.Is(e, flag.ErrHelp) {
 			return nil
 		}
 		return e
 	}
-	if fs.NArg() != 0 {
+	if fs.NArg() != 0 && !controlCommand(command) {
 		return errors.New("unexpected positional arguments")
 	}
-	if command != "serve" && command != "sync" && command != "run" && command != "config" && command != "status" {
+	if command != "serve" && command != "sync" && command != "run" && command != "config" && command != "status" && !controlCommand(command) {
 		return fmt.Errorf("unknown command %q", command)
 	}
 	if *once && command != "sync" {
 		return errors.New("--once is only valid for sync")
+	}
+	if !controlCommand(command) && (*source != "" || *wait != 0) {
+		return errors.New("source/wait options are only valid for deployment control")
 	}
 	c, e := Load(*configPath)
 	if e != nil {
@@ -133,6 +145,9 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		return e
 	}
 	catalog := deploy.New(store)
+	if controlCommand(command) {
+		return runControl(ctx, catalog, command, fs.Args(), *source, *wait, out)
+	}
 	if command == "status" {
 		return Status(ctx, c, catalog, out)
 	}
@@ -262,15 +277,24 @@ func Status(ctx context.Context, c Config, cat *deploy.Catalog, out io.Writer) e
 		URL      string `json:"url"`
 	}
 	type site struct {
-		Name       string    `json:"name"`
-		Owner      string    `json:"owner"`
-		Production string    `json:"productionRelease"`
-		URL        string    `json:"url"`
-		Previews   []preview `json:"previews"`
+		Name       string               `json:"name"`
+		Owner      string               `json:"owner"`
+		Production string               `json:"productionRelease"`
+		URL        string               `json:"url"`
+		Previews   []preview            `json:"previews"`
+		History    []string             `json:"history,omitempty"`
+		Assets     map[string]time.Time `json:"assetReleases,omitempty"`
+		Control    controlStatus        `json:"control"`
 	}
 	result := []site{}
 	for _, s := range sites {
 		x := site{Name: s.Name, Owner: s.Owner, Production: s.Production, URL: "https://" + deploy.Host(c.BaseDomain, c.PreviewStyle, s.Name, ""), Previews: []preview{}}
+		x.History = s.History
+		x.Assets = s.AssetReleases
+		x.Control, e = getControlStatus(ctx, cat, s)
+		if e != nil {
+			return e
+		}
 		tokens := make([]string, 0, len(s.Aliases))
 		for token := range s.Aliases {
 			tokens = append(tokens, token)

@@ -11,4 +11,5 @@ storage:
   path_style: true
 # Run `page serve` independently, or configure sources and use `page run`.
 # Tokens default to GITHUB_TOKEN; per-source token: ${SOURCE_TOKEN} also works.
+# Source asset_retention defaults to 24h; see examples/github.yaml.
 github: []

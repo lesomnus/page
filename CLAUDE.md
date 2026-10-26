@@ -9,14 +9,18 @@ of GitHub and of the SQL scaffold. See README.md and docs/mvp.md.
 - `internal/storage`: streaming object contract and S3 adapter. Memory storage
   exists for tests. Logical keys never depend on POSIX operations.
 - `internal/deploy`: versioned publication metadata, immutable snapshots,
-  stable source ownership, publication and owned deletion helpers.
+  stable source ownership, durable control intents, publication history,
+  previous-production asset leases and owned deletion helpers.
+- `internal/routes`: pure pages.json parser, inventory validation and resolver.
+  Publication, local route inspection and HTTP serving share this contract.
 - `internal/githubsync`: discovery, fixed-SHA publication, Git ref selection,
   preview aliases, retention and GC. Policies belong to the source sync.
 - `internal/serving`: reads published snapshots and serves HTTP. It never
   downloads from a source or makes retention decisions.
 - `internal/api`: directly implements generated Site/Deployment Get/List over
   the catalog. No SQL Sink, driver binding or generated mutation stack.
-- `internal/app`, `cmd/page`: serve/sync/run/status/config/version commands.
+- `internal/app`, `cmd/page`: serving/sync, local route inspection, deployment
+  control, status/config/version commands.
 - `cmd/scaffold`, `cli`, `cmd/*.go`, `ts/src`: retained upstream SQL/React
   example; use examples/scaffold.yaml. The product does not import its wiring.
 
@@ -27,7 +31,7 @@ npm ci --prefix ts
 go tool pd gen --ts .
 go mod tidy
 ./scripts/check.sh
-go test -race ./internal/api ./internal/app ./internal/deploy ./internal/githubsync ./internal/serving ./internal/storage
+go test -race ./internal/api ./internal/app ./internal/deploy ./internal/githubsync ./internal/routes ./internal/serving ./internal/storage
 ./scripts/test-s3.sh
 ```
 
@@ -50,6 +54,19 @@ configuration ID, not a process ID; origin metadata records the actual source.
 Upload files before the completion manifest, then replace the small site
 publication object. A failed pass keeps the last successful public state.
 Source listing failures are not deletion signals.
+
+External deployment commands only write operator intent to control.json. The
+owning source applies that intent to site.json, serialized with its GC; use
+ControlAppliedAt to distinguish saved intent from publication. Do not let an
+external command publish a release between source validation and deletion.
+Pinned/paused production still allows preview updates. Disabled intent is a
+durable tombstone and must survive discovery and source outages.
+
+Validate pages.json before writing the completion manifest. Route settings
+belong to the release. Previous-production asset leases expose only explicitly
+immutable non-HTML files on the production host until expiry, checked on every
+request. Preserve protected URL content across routing changes and rollback.
+Leases protect GC; publication history alone does not.
 
 Retire public references before GC. Check ownership and current references,
 remove the completion manifest before deleting content, and keep the upload

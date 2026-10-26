@@ -32,6 +32,7 @@ type Config struct {
 	ManifestPath      string        `yaml:"manifest_path"`
 	PollInterval      time.Duration `yaml:"poll_interval"`
 	GCGrace           time.Duration `yaml:"gc_grace"`
+	AssetRetention    time.Duration `yaml:"asset_retention"`
 	Branches          []string      `yaml:"branches"`
 	Tags              []string      `yaml:"tags"`
 	RecentCommits     int           `yaml:"recent_commits"`
@@ -92,6 +93,9 @@ func New(catalog *deploy.Catalog, cfg Config) (*Sync, error) {
 	if cfg.GCGrace == 0 {
 		cfg.GCGrace = 24 * time.Hour
 	}
+	if cfg.AssetRetention == 0 {
+		cfg.AssetRetention = 24 * time.Hour
+	}
 	if cfg.RecentCommits == 0 {
 		cfg.RecentCommits = 10
 	}
@@ -107,7 +111,7 @@ func New(catalog *deploy.Catalog, cfg Config) (*Sync, error) {
 	if cfg.Branches == nil {
 		cfg.Branches = []string{"*"}
 	}
-	if cfg.PollInterval < 0 || cfg.GCGrace < 0 || cfg.RecentCommits < 0 || cfg.RecentCommits > 1000 || cfg.MaxArchiveBytes < 1 || cfg.MaxFileBytes < 1 || cfg.MaxFiles < 1 {
+	if cfg.PollInterval < 0 || cfg.GCGrace < 0 || cfg.AssetRetention < 0 || cfg.RecentCommits < 0 || cfg.RecentCommits > 1000 || cfg.MaxArchiveBytes < 1 || cfg.MaxFileBytes < 1 || cfg.MaxFiles < 1 {
 		return nil, errors.New("invalid GitHub polling, retention or upload limits")
 	}
 	for _, p := range append(append([]string{}, cfg.Branches...), cfg.Tags...) {
@@ -153,6 +157,10 @@ func (s *Sync) Run(ctx context.Context) error {
 func (s *Sync) Once(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Operator intent is independent of forge reachability. Only the source
+	// owner materializes it into publication state, keeping activation and GC
+	// serialized even when the CLI runs in a separate process.
+	controlErr := s.reconcileControls(ctx)
 	endpoint := "/orgs/" + url.PathEscape(s.cfg.Owner) + "/repos"
 	if s.cfg.OwnerType == "user" {
 		endpoint = "/users/" + url.PathEscape(s.cfg.Owner) + "/repos"
@@ -165,7 +173,7 @@ func (s *Sync) Once(ctx context.Context) error {
 	}
 	repos, err := listPages[repository](ctx, s, endpoint)
 	if err != nil {
-		return err
+		return errors.Join(controlErr, err)
 	}
 	type candidate struct {
 		repo repository
@@ -198,6 +206,9 @@ func (s *Sync) Once(ctx context.Context) error {
 		candidates = append(candidates, candidate{repo, name})
 	}
 	var errs []error
+	if controlErr != nil {
+		errs = append(errs, controlErr)
+	}
 	for _, c := range candidates {
 		if err := s.syncRepository(ctx, c.repo, c.name); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", c.repo.FullName, err))
@@ -217,6 +228,13 @@ func (s *Sync) syncRepository(ctx context.Context, repo repository, name string)
 	}
 	if site.Owner != s.cfg.ID || site.RepositoryID != strconv.FormatInt(repo.ID, 10) {
 		return deploy.ErrOwnership
+	}
+	control, err := s.cat.GetControl(ctx, site)
+	if err != nil {
+		return err
+	}
+	if control.Mode == "disabled" {
+		return s.persistAndCollect(ctx, site)
 	}
 	branch := s.cfg.Branch
 	if branch == "" {
@@ -320,48 +338,11 @@ func (s *Sync) syncRepository(ctx context.Context, repo repository, name string)
 	site.Repository = repo.FullName
 	site.Production = production
 	site.Aliases = aliases
-	if site.Retired == nil {
-		site.Retired = map[string]time.Time{}
-	}
-	keep := map[string]bool{production: true}
-	for _, a := range aliases {
-		keep[a.Release] = true
-	}
-	releases, err := s.cat.ListReleases(ctx, s.cfg.ID, name)
-	if err != nil {
+	if err := s.persistAndCollect(ctx, site); err != nil {
 		return err
 	}
-	now := s.now()
-	for _, r := range releases {
-		if keep[r.ID] {
-			delete(site.Retired, r.ID)
-			continue
-		}
-		if _, exists := site.Retired[r.ID]; !exists {
-			site.Retired[r.ID] = now
-		}
-	}
-	site.UpdatedAt = now
-	if err := s.cat.SaveSite(ctx, site); err != nil {
-		return err
-	}
-	var gcErrs []error
-	for id, retired := range site.Retired {
-		if keep[id] || now.Sub(retired) < s.cfg.GCGrace {
-			continue
-		}
-		if err := s.cat.DeleteRelease(ctx, site, id); err != nil {
-			gcErrs = append(gcErrs, err)
-			continue
-		}
-		delete(site.Retired, id)
-		slog.InfoContext(ctx, "release collected", "source", s.cfg.ID, "site", name, "release", id)
-	}
-	if err := s.cat.SaveSite(ctx, site); err != nil {
-		gcErrs = append(gcErrs, err)
-	}
-	slog.InfoContext(ctx, "repository synchronized", "source", s.cfg.ID, "repository", repo.FullName, "site", name, "production", production, "previews", len(aliases))
-	return errors.Join(gcErrs...)
+	slog.InfoContext(ctx, "repository synchronized", "source", s.cfg.ID, "repository", repo.FullName, "site", name, "production", site.Production, "previews", len(site.Aliases))
+	return nil
 }
 
 // Failed first uploads have no published Site to carry retirement timestamps.

@@ -43,6 +43,7 @@ github:
     manifest_path: manifest.json
     poll_interval: 1m
     gc_grace: 24h
+    asset_retention: 24h
     branches: ["main", "develop", "feature/*"]
     tags: ["v*"]
     recent_commits: 10
@@ -58,13 +59,16 @@ github:
 - `branches`와 `tags`는 짧은 Git ref 이름에 적용하는 glob이다. `*`는 전체를 선택한다.
 - `recent_commits`는 운영 브랜치의 first-parent를 따라 선택할 커밋 수다. 기본은 10이고,
   커밋 시간순이나 최근 성공 배포 수를 의미하지 않는다.
+- `asset_retention`은 운영 전환 뒤 이전 릴리스의 불변 자산을 제공할 기간이며 기본은
+  24시간이다. `gc_grace`는 공개 참조와 자산 유예가 모두 끝난 릴리스의 삭제 대기 기간이다.
 - 업로드 제한은 `max_archive_bytes`(압축/확장 아카이브, 기본 256 MiB),
   `max_file_bytes`(기본 64 MiB), `max_files`(기본 10,000)로 설정한다.
 
 AWS 자격 증명은 SDK의 표준 환경 변수·프로파일·실행 환경 자격 증명 체인을 따른다.
 실제 AWS S3에서는 버킷을 먼저 만들고 endpoint를 비운다. sync에는 해당 prefix의
 객체 읽기·쓰기·삭제와 버킷 목록 권한이 필요하며 서빙 프로세스는 읽기·목록 권한으로
-실행할 수 있다. 자격 증명은 게시 메타데이터에 넣지 않는다.
+실행할 수 있다. 배포 제어 CLI에는 읽기·목록과 제어 객체 쓰기 권한이 필요하다.
+자격 증명은 게시 메타데이터에 넣지 않는다.
 
 ## 발견·게시 계약
 
@@ -93,6 +97,7 @@ manifest의 파일명은 설정 가능하며 스키마 버전은 1이다. 게시
 
 ```text
 sites/foo/site.json
+sites/foo/control.json
 sources/github-acme/sites/foo/releases/<release-id>/
   upload.json
   manifest.json
@@ -103,6 +108,123 @@ sources/github-acme/sites/foo/releases/<release-id>/
 `owner`는 수명주기 소유자이며 `origin`은 소스 종류·레포 ID·커밋·게시 디렉터리다.
 내부 release ID와 Git SHA는 다른 식별자다. 파일 metadata에는 MIME·크기·SHA-256을,
 사이트 객체에는 운영·preview 참조와 GC 대기 상태를 기록한다.
+
+## pages.json 라우팅
+
+게시 디렉터리 루트에 선택적으로 `pages.json`을 둔다. 레포 루트의 배포 manifest와는
+별도 파일이다. 설정과 대상 파일 목록을 게시 전에 검증하며 완성된 릴리스에 고정한다.
+알 수 없는 필드·지원하지 않는 버전·잘못된 대상·64 KiB를 넘는 설정은 게시를 거부한다.
+실패한 배포가 기존 운영 배포를 바꾸지 않는다.
+
+```text
+public/
+  pages.json
+  index.html
+  about.html
+  404.html
+  guides/start.html
+  assets/app.a1b2.js
+```
+
+[examples/pages.json](../examples/pages.json)은 위 파일 목록에 적용할 수 있는 예시다.
+핵심 필드는 다음과 같다.
+
+| 필드 | 동작 |
+| --- | --- |
+| `schemaVersion` | 현재 `1` |
+| `routing.cleanUrls` | `/about`을 `about.html`로 조회. 기본 `false` |
+| `routing.index` | 디렉터리 index 파일명. 기본 `index.html` |
+| `routing.trailingSlash` | `preserve`(기본), `append`, `remove`. 파일 자체의 URL은 우선하며 index·clean URL에 적용 |
+| `routing.routes` | 선언 순서대로 첫 일치 규칙의 `rewrite` 또는 `redirect` 수행 |
+| `routing.fallback` | 파일이 없는 HTML 탐색에 `rewrite` 적용. `exclude` 경로는 제외 |
+| `routing.errorPages.404` | 파일이 없는 요청에 지정 문서를 HTTP 404로 응답 |
+| `headers` | 원래 요청 경로에 일치하는 `from`의 `set` 헤더 적용. 뒤 규칙이 앞 값을 덮어씀 |
+| `assets.immutable` | 이전 운영 릴리스 자산 유예 서빙에 포함할 경로 패턴 |
+
+경로 패턴은 `/`로 시작하며 `:name`은 한 segment, 마지막 segment인 `*`는 나머지
+경로를 캡처한다. rewrite·redirect 대상에 같은 `:name` 또는 `*`를 사용할 수 있다.
+예를 들어 `/docs/:page` → `/guides/:page.html`은 `/docs/start`를 `guides/start.html`로
+조회한다. rewrite는 다시 규칙 목록을 순회하지 않는 한 번의 파일 조회다. 동적 대상은
+실제 파일과 일치하는 대상이 하나 이상 있어야 하며, 요청 시 대상 파일이 없으면 404다.
+
+redirect는 사이트 내 절대 경로만 허용한다. 기본 상태는 302이며 301·302·307·308을
+지원한다. 외부 URL·query가 포함된 대상·경로 탈출·redirect 순환은 거부한다.
+redirect의 출력 패턴이 다른 redirect의 입력과 겹치면 의존 관계로 검사하므로,
+동적 캡처 값에 따라 종료할 수 있는 설정도 순환 가능성이 있으면 보수적으로 거부한다.
+redirect 응답은 원래 요청의 query를 유지한다. 기본 `preserve`도 디렉터리 index를
+찾은 `/guide`를 `/guide/`로 정규화한다.
+
+SPA fallback은 HTML 탐색 요청에만 적용한다. Accept와 Sec-Fetch-Dest를 확인하며
+누락 시 확장자가 없거나 HTML인 경로를 탐색으로 취급한다. `/assets/*` 같은 정적 자산
+경로를 `exclude`에 넣어 없는 JS·CSS에 HTML이 응답되지 않도록 설정한다. custom 404는
+HEAD에서 본문을 생략하고 Range·조건부 요청에도 404 상태를 유지한다.
+
+응답 헤더는 CSP·Cache-Control 등을 설정할 수 있다. Content-Type·Content-Length·
+ETag·Location·Set-Cookie·연결 관련 헤더처럼 서버가 관리하는 값과 CR/LF는 거부한다.
+`X-Content-Type-Options`는 `nosniff`만 허용한다. 기본 파일 응답은
+`Cache-Control: no-cache`이며 불변 자산의 긴 캐시는 직접 설정한다. 헤더 규칙은
+404·redirect에도 적용되므로 긴 캐시를 설정할 때는 해당 경로의 오류 응답도 고려한다.
+
+배포 전 로컬에서 동일한 검증기와 resolver를 실행한다. Storage 설정이나 자격 증명은
+필요 없다. `--navigation=false`는 위치 인자 앞에 쓴다.
+
+```sh
+go run ./cmd/page routes validate ./public
+go run ./cmd/page routes test ./public /docs/start
+go run ./cmd/page routes test --navigation=false ./public /assets/missing.js
+```
+
+`test`는 최종 파일 `Path`, HTTP `Status`, `Redirect`, `Headers`, 처리 `Action`을
+JSON으로 출력한다. pages.json이 없을 때도 기본 정적 파일 규칙을 검사할 수 있다.
+
+## 배포 제어
+
+운영 배포를 변경하는 명령은 Storage의 `control.json`에 의도를 저장한다. Git sync가
+이를 읽어 자기 소유 사이트에 반영하고 `site.json`을 교체한다. 소스 정책과 GC를
+한 소유자에서 직렬 처리하므로 별도 CLI가 삭제 중인 릴리스를 공개하지 않는다.
+각 소스·사이트에는 활성 writer를 하나만 실행한다.
+
+```sh
+go run ./cmd/page releases foo
+go run ./cmd/page promote foo RELEASE --wait 90s
+go run ./cmd/page rollback foo --wait 90s
+go run ./cmd/page rollback foo RELEASE
+go run ./cmd/page pin foo
+go run ./cmd/page pause foo
+go run ./cmd/page resume foo
+go run ./cmd/page remove foo
+```
+
+| 명령 | 저장하는 의도 |
+| --- | --- |
+| `releases SITE` | 보존 중인 릴리스의 ID·SHA·운영 여부·자산 만료 시각 조회 |
+| `promote SITE RELEASE` | 완성된 같은 사이트·레포의 릴리스를 운영으로 지정하고 고정 |
+| `rollback SITE [RELEASE]` | 지정 릴리스, 생략하면 운영 이력 중 아직 보존된 직전 릴리스로 고정 |
+| `pin SITE [RELEASE]` | 지정 릴리스, 생략하면 현재 운영 배포 고정 |
+| `pause SITE` | 현재 운영 배포를 유지하고 자동 전환 일시 중지 |
+| `resume SITE` | 고정·일시 중지·철거를 해제하고 소스 정책에 따른 자동 전환 재개 |
+| `remove SITE` | 운영·preview 공개를 중단하고 재발견되어도 다시 게시하지 않도록 유지 |
+
+`RELEASE`는 Git SHA가 아닌 `releases` 출력의 내부 ID다. 고정과 pause 중에도
+선택한 preview는 갱신한다. promote·rollback·pin은 resume 전까지 유지된다. 이력은
+최근 운영 릴리스 ID를 최대 32개 기록하며, 이력만으로 GC를 막지는 않는다.
+이미 수집된 릴리스로는 rollback할 수 없다.
+
+명령은 기본적으로 요청 저장 직후 JSON을 출력한다. `controlApplied: false`이면
+소유 sync가 아직 반영하지 않은 상태다. `--wait 90s`는 적용 확인까지 기다리며
+시간이 지나도 저장한 요청은 유지된다. 비활성 sync의 요청은 대기 상태로 남는다.
+제어 의도와 게시 상태는 `status`의 `control`에서도 볼 수 있다. 데이터 평면은 반영된
+사이트 metadata를 `refresh_interval`에 따라 읽으므로 적용 뒤에도 이 지연이 있다.
+
+`--config`, `--source`, `--wait`는 명령의 위치 인자 앞뒤에 둘 수 있다. `--source`는
+사이트 소유 ID를 검증하며 생략하면 기존 소유자를 사용한다. 제어 API는 별도 인증
+계층을 추가하지 않으므로 이 CLI의 Storage 쓰기 자격 증명을 운영 권한으로 관리한다.
+
+소유 sync는 새로운 제어 의도를 GitHub 조회 전에 반영할 수 있다. GitHub 장애 중에도
+보존된 릴리스의 고정·일시 중지·공개 중단 요청을 처리한다. resume 뒤 최신 소스
+배포는 다음 성공한 GitHub 조회에 따라 결정된다. 대상이 요청 저장과 반영 사이에
+사라지면 기존 공개 상태를 유지하고 요청은 미적용 상태로 남는다. `status`에
+`requested release is no longer retained`가 표시되면 보존된 대상으로 다시 요청한다.
 
 ## preview와 보존
 
@@ -133,14 +255,37 @@ flat URL은 `<별칭>--foo.example.com`, nested URL은 `<별칭>.foo.example.com
 미게시·만료 URL 요청은 GitHub 다운로드를 유발하지 않는다.
 
 참조 제거 시각을 Storage에 기록하고 `gc_grace` 이후 자기 소유이며 현재 운영·다른
-별칭에서 참조하지 않는 배포만 삭제한다. 부분 삭제 실패와 재시작 뒤에는 다음 성공한
+별칭·만료 전 자산 유예에서 참조하지 않는 배포만 삭제한다. 부분 삭제 실패와 재시작 뒤에는 다음 성공한
 동기화에서 이어서 처리한다. 조회 실패·권한 오류·불완전한 pagination을 빈 보존 집합으로
 취급하지 않는다.
 
 저장소 삭제·이름 변경·소스 설정 제거는 기존 게시물을 자동 삭제하지 않는다.
-명시적 전체 철거는 소유자를 확인하고 사이트 공개 참조를 제거한 뒤, 서빙 캐시와
-진행 중 요청의 유예를 두고 소유 prefix를 정리하는 Storage 운영 작업이다.
-별도의 철거 CLI는 없다.
+`remove`로 명시적으로 공개를 중단한 사이트는 tombstone을 남겨 재발견에 따른 복원을
+막는다. 소유 sync는 GitHub가 응답하지 않아도 그 사이트의 보존·GC를 진행할 수 있다.
+자산 유예도 제거되며 `gc_grace`가 지난 자기 릴리스를 수집한다. 재사용하려면
+`resume`하고 sync를 실행한다. 소스 설정 자체를 제거하면 해당 소유 sync의 GC도 멈춘다.
+
+## 배포 전환 시 자산
+
+운영 HTML을 교체해도 이미 열린 브라우저는 이전 HTML이 가리키는 JS·CSS·이미지를
+추가 요청할 수 있다. 전환 시 이전 **운영** 릴리스에 자산 lease를 남겨 이 요청을
+처리한다. 기간은 소스의 `asset_retention`이며 서버는 요청마다 만료를 확인한다.
+
+이전 릴리스의 `pages.json`에서 `assets.immutable`로 선언한 실제 파일만 대상이다.
+HTML·XHTML·pages.json은 확장자와 MIME을 검사해 제외한다. 운영 호스트에서 현재
+파일을 찾지 못했을 때, SPA fallback 또는 404 대신 만료 전 이전 자산을 조회한다.
+명시적인 rewrite·redirect가 있으면 그 규칙을 우선한다. preview 호스트에는 이전
+운영 자산을 추가하지 않으며 선택되지 않은 preview 릴리스를 되살리지 않는다.
+
+`/assets/app.a1b2.js`처럼 콘텐츠 해시를 파일명에 포함한다. 보호 기간 동안 같은 URL에
+다른 바이트나 MIME을 게시하거나, 그 URL을 redirect하거나, 없는 대상 또는 다른
+콘텐츠로 rewrite하는 전환은 거부한다. 고정·rollback도 같은 검증을 통과해야 한다.
+`assets.immutable`을 선언하지 않은 이전 일반 파일·HTML은 새 운영 릴리스로 전환한
+뒤 서빙하지 않는다.
+
+자산 lease가 끝나면 서빙을 중단하고 공개 참조가 없는 릴리스를 GC 대상으로 삼는다.
+객체가 아직 Storage에 남아 있어도 만료된 자산을 응답하지 않는다. `gc_grace`는
+서빙 metadata 재조회와 진행 중 다운로드를 위한 별도의 삭제 유예다.
 
 ## HTTP와 DNS/TLS
 
@@ -209,7 +354,7 @@ CI와 `scripts/test-s3.sh`에 포함한다.
 
 ## 후속 범위
 
-OCI sync, 다른 Git forge, webhook, FS/CephFS backend, 고급 `pages.json` 라우팅,
+OCI sync, 다른 Git forge, webhook, FS/CephFS backend, 외부 redirect·proxy,
 임의 revision의 요청 시 게시, 공유 blob 중복 제거, 복수 소유자, SaaS·관리 콘솔과
 분산 전역 일관성은 포함하지 않는다. OCI 추가 시에는 OCI 고유의 tag/digest와 정책을
 구현하고 공통 게시·Storage·서빙 경계에 연결한다.

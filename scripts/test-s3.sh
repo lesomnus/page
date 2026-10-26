@@ -25,4 +25,4 @@ export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-page-dev}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-page-dev-secret}"
 export AWS_EC2_METADATA_DISABLED=true
 
-go test -count=1 -timeout 2m -run '^(TestS3Integration|TestMVPWithS3)$' -v ./internal/storage ./internal/app
+go test -count=1 -timeout 2m -run '^(TestS3Integration|TestMVPWithS3|TestExpansionWithS3)$' -v ./internal/storage ./internal/app

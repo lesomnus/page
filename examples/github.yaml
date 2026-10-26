@@ -20,3 +20,4 @@ github:
     branches: [main, 'feature/*']
     tags: ['v*']
     gc_grace: 24h
+    asset_retention: 24h

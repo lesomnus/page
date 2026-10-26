@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "routing": {
+    "cleanUrls": true,
+    "index": "index.html",
+    "trailingSlash": "preserve",
+    "routes": [
+      { "from": "/old", "redirect": "/about", "status": 308 },
+      { "from": "/docs/:page", "rewrite": "/guides/:page.html" }
+    ],
+    "fallback": {
+      "rewrite": "/index.html",
+      "exclude": ["/assets/*", "/api/*"]
+    },
+    "errorPages": { "404": "/404.html" }
+  },
+  "headers": [
+    { "from": "/*", "set": { "Referrer-Policy": "strict-origin-when-cross-origin" } }
+  ],
+  "assets": { "immutable": ["/assets/*"] }
+}

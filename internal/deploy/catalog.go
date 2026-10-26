@@ -67,6 +67,19 @@ func validateSite(s *Site) error {
 			return fmt.Errorf("%w: preview alias", ErrInvalid)
 		}
 	}
+	if s.AssetRetention < 0 {
+		return ErrInvalid
+	}
+	for id, until := range s.AssetReleases {
+		if !ValidID(id) || until.IsZero() {
+			return ErrInvalid
+		}
+	}
+	for _, id := range s.History {
+		if !ValidID(id) {
+			return ErrInvalid
+		}
+	}
 	for id, t := range s.Retired {
 		if !ValidID(id) || t.IsZero() {
 			return fmt.Errorf("%w: retirement", ErrInvalid)
@@ -164,45 +177,8 @@ func (c *Catalog) ListSites(ctx context.Context) ([]*Site, error) {
 func (c *Catalog) SaveSite(ctx context.Context, s *Site) error {
 	c.mutation.Lock()
 	defer c.mutation.Unlock()
-	if err := validateSite(s); err != nil {
+	if err := c.prepareSite(ctx, s, nil); err != nil {
 		return err
-	}
-	old, err := c.GetSite(ctx, s.Name)
-	if err == nil {
-		if old.Owner != s.Owner || old.RepositoryID != s.RepositoryID {
-			return ErrOwnership
-		}
-		s.CreatedAt = old.CreatedAt
-	} else if !errorsIsNotFound(err) {
-		return err
-	}
-	refs := map[string]bool{}
-	if s.Production != "" {
-		refs[s.Production] = true
-	}
-	for _, a := range s.Aliases {
-		refs[a.Release] = true
-	}
-	for id := range refs {
-		r, err := c.GetRelease(ctx, s.Owner, s.Name, id)
-		if err != nil {
-			return err
-		}
-		if !r.Complete {
-			return fmt.Errorf("%w: incomplete release", ErrInvalid)
-		}
-		if r.Origin.RepositoryID != s.RepositoryID {
-			return fmt.Errorf("%w: release repository mismatch", ErrInvalid)
-		}
-		for _, a := range s.Aliases {
-			if a.Release == id && a.Revision != r.Origin.Revision {
-				return fmt.Errorf("%w: alias revision mismatch", ErrInvalid)
-			}
-		}
-	}
-	s.UpdatedAt = time.Now().UTC()
-	if s.CreatedAt.IsZero() {
-		s.CreatedAt = s.UpdatedAt
 	}
 	return c.write(ctx, SiteKey(s.Name), s)
 }
@@ -220,6 +196,9 @@ func (c *Catalog) GetRelease(ctx context.Context, owner, site, id string) (*Rele
 	}
 	if r.Owner != owner || r.Site != site || r.ID != id || !r.Complete {
 		return nil, ErrInvalid
+	}
+	if err := c.loadPages(ctx, &r); err != nil {
+		return nil, err
 	}
 	return &r, nil
 }
@@ -284,6 +263,9 @@ func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin
 		}
 		r.Files[f.Path] = File{Path: f.Path, Size: f.Size, ContentType: typ, SHA256: hex.EncodeToString(h.Sum(nil))}
 	}
+	if err := c.loadPages(ctx, r); err != nil {
+		return nil, err
+	}
 	r.Complete = true
 	if err := c.write(ctx, ReleasePrefix(owner, site, id)+"manifest.json", r); err != nil {
 		return nil, err
@@ -342,6 +324,9 @@ func (c *Catalog) ListReleases(ctx context.Context, owner, site string) ([]*Rele
 }
 
 func referenced(s *Site, id string) bool {
+	if until, ok := s.AssetReleases[id]; ok && until.After(time.Now().UTC()) {
+		return true
+	}
 	if s.Production == id {
 		return true
 	}
@@ -382,6 +367,13 @@ func (c *Catalog) DeleteRelease(ctx context.Context, s *Site, id string) error {
 	} else if current.Owner != s.Owner || current.RepositoryID != s.RepositoryID {
 		return ErrOwnership
 	} else if referenced(current, id) {
+		return ErrReferenced
+	}
+	ctrl, err := c.GetControl(ctx, s)
+	if err != nil {
+		return err
+	}
+	if (ctrl.Mode == "pinned" || ctrl.Mode == "paused") && ctrl.Target == id {
 		return ErrReferenced
 	}
 	prefix := ReleasePrefix(s.Owner, s.Name, id)

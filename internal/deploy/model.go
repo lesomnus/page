@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lesomnus/page/internal/routes"
 	"github.com/lesomnus/page/internal/storage"
 )
 
@@ -48,6 +49,7 @@ type Release struct {
 	CreatedAt     time.Time       `json:"createdAt"`
 	Complete      bool            `json:"complete"`
 	Files         map[string]File `json:"files"`
+	Pages         *routes.Config  `json:"pages,omitempty"`
 }
 
 // Alias is a source-specific name resolved to an already published snapshot.
@@ -59,16 +61,32 @@ type Alias struct {
 }
 
 type Site struct {
-	SchemaVersion int                  `json:"schemaVersion"`
-	Name          string               `json:"name"`
-	Owner         string               `json:"owner"`
-	RepositoryID  string               `json:"repositoryId"`
-	Repository    string               `json:"repository"`
-	Production    string               `json:"production"`
-	Aliases       map[string]Alias     `json:"aliases"`
-	Retired       map[string]time.Time `json:"retired,omitempty"`
-	UpdatedAt     time.Time            `json:"updatedAt"`
-	CreatedAt     time.Time            `json:"createdAt"`
+	SchemaVersion    int                  `json:"schemaVersion"`
+	Name             string               `json:"name"`
+	Owner            string               `json:"owner"`
+	RepositoryID     string               `json:"repositoryId"`
+	Repository       string               `json:"repository"`
+	Production       string               `json:"production"`
+	Aliases          map[string]Alias     `json:"aliases"`
+	Retired          map[string]time.Time `json:"retired,omitempty"`
+	UpdatedAt        time.Time            `json:"updatedAt"`
+	CreatedAt        time.Time            `json:"createdAt"`
+	History          []string             `json:"history,omitempty"`
+	AssetReleases    map[string]time.Time `json:"assetReleases,omitempty"`
+	AssetRetention   time.Duration        `json:"assetRetention,omitempty"`
+	Disabled         bool                 `json:"disabled,omitempty"`
+	ControlMode      string               `json:"controlMode,omitempty"`
+	ControlAppliedAt time.Time            `json:"controlAppliedAt,omitempty"`
+}
+
+// Control is operator intent, separate from the sync's derived publication.
+type Control struct {
+	SchemaVersion int       `json:"schemaVersion"`
+	Owner         string    `json:"owner"`
+	RepositoryID  string    `json:"repositoryId"`
+	Mode          string    `json:"mode"`
+	Target        string    `json:"target,omitempty"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 type InputFile struct {

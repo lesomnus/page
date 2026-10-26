@@ -57,6 +57,45 @@ go run ./cmd/page version
 `--config`는 명령 앞뒤에 둘 수 있으며 기본 파일은 `page.yaml`이다. `serve`는
 GitHub에 접속하지 않는다. sync가 중단되어도 이미 게시한 사이트는 계속 제공한다.
 
+## 라우팅과 배포 제어
+
+게시 디렉터리 루트의 `pages.json`으로 rewrite·내부 redirect·clean URL·SPA fallback·
+응답 헤더·404 문서를 설정한다. 설정은 파일 목록과 함께 검증하고 릴리스에 고정한다.
+파일이 없으면 기본 정적 파일·directory index 동작을 사용한다.
+[설정 예시](examples/pages.json)와 [라우팅 규칙](docs/mvp.md#pagesjson-라우팅)을 참고한다.
+
+```sh
+go run ./cmd/page routes validate ./public
+go run ./cmd/page routes test ./public /docs/start
+go run ./cmd/page routes test --navigation=false ./public /assets/missing.js
+```
+
+다음 명령은 Storage에 남아 있는 릴리스를 조회하거나 운영 배포의 제어 의도를 기록한다.
+`RELEASE`에는 `releases`가 출력한 내부 ID를 사용한다.
+
+```sh
+go run ./cmd/page releases foo
+go run ./cmd/page promote foo RELEASE --wait 90s
+go run ./cmd/page rollback foo --wait 90s
+go run ./cmd/page pin foo             # 현재 운영 배포 고정
+go run ./cmd/page pause foo           # 운영 배포 자동 전환 일시 중지
+go run ./cmd/page resume foo          # 소스 정책에 따른 자동 전환 재개
+go run ./cmd/page remove foo          # 운영·preview 공개 중단
+```
+
+제어 명령은 `control.json`에 요청을 저장하고 소유 sync가 다음 실행에서 적용한다.
+`--wait`는 적용 확인까지 기다린다. sync가 실행 중이 아니면 요청은 대기 상태다.
+`status`의 `controlApplied`로 적용 여부를 확인한다. promote·rollback·pin은 resume까지
+운영 배포를 고정하며 pause 중에도 preview는 갱신한다. 관리 명령에는 Storage 쓰기
+권한이 필요하다. `--config`, `--source`, `--wait`는 사이트 이름 앞뒤에 둘 수 있다.
+
+배포 전환 뒤에는 이전 운영 릴리스의 `assets.immutable` 파일만 `asset_retention`
+동안 기존 URL로 제공한다. 기본 유예는 24시간이며 HTML과 게시되지 않은 preview
+파일은 포함하지 않는다. 파일명에 콘텐츠 해시를 넣고 같은 URL의 내용을 바꾸지 않는다.
+자세한 제어·자산 보존 의미론은 [운영 안내](docs/mvp.md)에 기록했다.
+
+## preview와 읽기 API
+
 preview는 기본적으로 `<별칭>--foo.example.com`을 사용한다.
 `preview_style: nested`면 `<별칭>.foo.example.com`이며 앱별 DNS/TLS가 필요하다.
 별칭에는 ref 종류 접두사와 충돌 방지 해시가 포함된다. 게시된 사이트의 전체 SHA와
@@ -101,6 +140,7 @@ go mod tidy
 `v0.0.0-20261025134239-7ae6f76a47ac`에 고정되어 있다.
 
 [MVP 설정·운영 안내](docs/mvp.md)에 데이터 구조와 preview/GC 의미론, DNS/TLS,
-검증 범위를 기록했다. [구현 계획 #2](https://github.com/lesomnus/page/issues/2)는
-8개 sub-issue를 포함한다. [기존 설계 노트 #1](https://github.com/lesomnus/page/issues/1)의
-넓은 후속 구상과 현재 MVP 범위는 구분한다.
+검증 범위를 기록했다. 기본 MVP는 [계획 #2](https://github.com/lesomnus/page/issues/2),
+라우팅·배포 제어·이전 자산 처리는 [확장 계획 #14](https://github.com/lesomnus/page/issues/14)와
+sub-issue #15–#18에서 추적한다. [기존 설계 노트 #1](https://github.com/lesomnus/page/issues/1)은
+더 넓은 후속 구상을 담고 있다.
