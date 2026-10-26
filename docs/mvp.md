@@ -26,6 +26,7 @@ listen: ":8080"
 api_listen: "127.0.0.1:50051"
 base_domain: example.com
 preview_style: flat
+preview_alias_mode: qualified
 refresh_interval: 5s
 storage:
   bucket: page
@@ -238,8 +239,8 @@ go run ./cmd/page remove foo
 
 branch/tag 별칭은 해당 ref의 최신 성공 배포를 가리킨다. 새 배포가 실패하면 이전
 성공 배포를 유지한다. commit 별칭은 전체 SHA에 고정되며 같은 snapshot은 공유한다.
-별칭은 `b-`, `t-`, `c-` 종류 접두사, 안전한 slug와 해시로 구성한다. 원래 ref와
-전체 SHA는 metadata에 남는다. 다음 명령은 Storage만 읽어 사이트·운영 URL과
+기본 `preview_alias_mode: qualified`는 `b-`, `t-`, `c-` 종류 접두사, 안전한 slug와
+해시로 별칭을 구성한다. 원래 ref와 전체 SHA는 metadata에 남는다. 다음 명령은 Storage만 읽어 사이트·운영 URL과
 preview별 ref·SHA·정확한 URL을 JSON으로 출력한다. HTTP/gRPC 서버가 실행 중일
 필요는 없다.
 
@@ -255,7 +256,23 @@ curl -H 'Host: foo.example.com' http://127.0.0.1:8080/
 ```
 
 flat URL은 `<별칭>--foo.example.com`, nested URL은 `<별칭>.foo.example.com`이다.
-길거나 변환 결과가 같은 이름은 해시를 포함하는 길이 제한 규칙으로 구별한다.
+기본 모드는 길거나 변환 결과가 같은 이름을 해시가 포함된 길이 제한 규칙으로 구별한다.
+
+서버 설정을 `preview_alias_mode: tag-first`로 바꾸면 branch/tag는 ref 종류와 해시를
+생략한다. `refs/heads/feat/test`는 `feat-test--foo.example.com`,
+`refs/tags/v0.1.0`은 `v0-1-0--foo.example.com`으로 제공한다. ref 이름을 소문자로
+바꾸고 구두점은 하이픈 하나로 합친다. 같은 주소에 게시된 tag가 있으면 tag를
+선택하고, 없으면 branch를 선택한다. tag가 보존 정책에서 제거되면 다음 서버
+갱신 때 같은 주소가 branch로 전환된다. 원격 GitHub의 ref를 요청마다 조회하지 않는다.
+소스 조회가 실패하면 마지막으로 성공한 게시 상태를 유지한다.
+
+같은 종류의 여러 ref가 같은 주소로 변환되면 그 짧은 주소는 제공하지 않는다.
+tag끼리 모호한 경우 branch로 대신 제공하지 않는다. DNS 길이 제한을 넘거나 다른
+사이트의 운영 주소·기존 별칭 주소와 충돌해도 짧은 주소를 제공하지 않는다.
+`status`는 선택한 짧은 URL과 commit URL을 `previews`에 출력하고, 짧은 주소를 쓰지
+못한 ref는 이유와 기존 URL을 `previewProblems`에 출력한다. 기존 접두사·해시가
+있는 branch/tag URL은 계속 동작하며 commit URL은 바뀌지 않는다. 이 설정은 URL
+선택만 바꾸며 ref 보존 정책과 Storage metadata 형식은 바꾸지 않는다.
 
 현재 운영 배포, 선택 branch/tag의 최신 성공 배포와 최근 N개 선택 커밋의 배포를
 보존한다. branch를 유지한다고 모든 과거 배포를 영구 보존하지 않는다. 정책에서

@@ -102,6 +102,11 @@ go run ./cmd/page remove foo          # 운영·preview 공개 중단
 
 preview는 기본적으로 `<별칭>--foo.example.com`을 사용한다.
 `preview_style: nested`면 `<별칭>.foo.example.com`이며 앱별 DNS/TLS가 필요하다.
+
+`preview_alias_mode: tag-first`는 `feat/test`를 `feat-test--foo.example.com`처럼
+짧게 제공한다. 같은 주소의 tag를 우선하고 없으면 branch를 선택한다. 기존
+접두사·해시 URL도 계속 동작한다. 기본 모드는 `qualified`이며 충돌 처리와 보존
+규칙은 [MVP 안내](docs/mvp.md#preview와-보존)에 설명한다.
 별칭에는 ref 종류 접두사와 충돌 방지 해시가 포함된다. 게시된 사이트의 전체 SHA와
 정확한 운영·preview URL은 서버를 시작하지 않고도 Storage에서 조회할 수 있다.
 

@@ -34,15 +34,7 @@ func Host(baseDomain, style, site, token string) string {
 }
 
 func boundedLabel(value, identity string, limit int) string {
-	var b strings.Builder
-	for _, c := range strings.ToLower(value) {
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-			b.WriteRune(c)
-		} else if b.Len() > 0 && !strings.HasSuffix(b.String(), "-") {
-			b.WriteByte('-')
-		}
-	}
-	slug := strings.Trim(b.String(), "-")
+	slug := dnsSlug(value)
 	if slug == "" {
 		slug = "ref"
 	}
@@ -52,4 +44,16 @@ func boundedLabel(value, identity string, limit int) string {
 		slug = strings.TrimRight(slug[:limit-len(suffix)-1], "-")
 	}
 	return slug + "-" + suffix
+}
+
+func dnsSlug(value string) string {
+	var b strings.Builder
+	for _, c := range strings.ToLower(value) {
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteRune(c)
+		} else if b.Len() > 0 && !strings.HasSuffix(b.String(), "-") {
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }

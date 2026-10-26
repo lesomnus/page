@@ -25,9 +25,10 @@ import (
 )
 
 type Config struct {
-	BaseDomain      string        `yaml:"base_domain"`
-	PreviewStyle    string        `yaml:"preview_style"`
-	RefreshInterval time.Duration `yaml:"refresh_interval"`
+	BaseDomain       string        `yaml:"base_domain"`
+	PreviewStyle     string        `yaml:"preview_style"`
+	PreviewAliasMode string        `yaml:"preview_alias_mode"`
+	RefreshInterval  time.Duration `yaml:"refresh_interval"`
 }
 
 type retainedAsset struct {
@@ -64,6 +65,11 @@ func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
 	if config.PreviewStyle != "flat" && config.PreviewStyle != "nested" {
 		return nil, errors.New("serving: preview_style must be flat or nested")
 	}
+	var err error
+	config.PreviewAliasMode, err = deploy.PreviewAliasMode(config.PreviewAliasMode)
+	if err != nil {
+		return nil, fmt.Errorf("serving: %w", err)
+	}
 	if config.RefreshInterval == 0 {
 		config.RefreshInterval = 5 * time.Second
 	}
@@ -81,6 +87,14 @@ func (h *Handler) Refresh(ctx context.Context) error {
 	sites, err := h.catalog.ListSites(ctx)
 	if err != nil {
 		return fmt.Errorf("serving: list sites: %w", err)
+	}
+	previews, err := deploy.PlanPreviews(sites, h.config.BaseDomain, h.config.PreviewStyle, h.config.PreviewAliasMode)
+	if err != nil {
+		return fmt.Errorf("serving: plan previews: %w", err)
+	}
+	bySite := map[string][]deploy.PreviewRoute{}
+	for _, preview := range previews.Routes {
+		bySite[preview.Site] = append(bySite[preview.Site], preview)
 	}
 	next := &snapshot{routes: make(map[string]route)}
 	now := h.now()
@@ -135,12 +149,9 @@ func (h *Handler) Refresh(ctx context.Context) error {
 				return left.ID < right.ID
 			})
 		}
-		add := func(token, id, revision string) error {
+		add := func(host, id, revision string, production bool) error {
 			if id == "" {
 				return nil
-			}
-			if token != "" && !deploy.ValidName(token) {
-				return errors.New("serving: invalid preview token")
 			}
 			result, e := load(id)
 			if e != nil {
@@ -149,10 +160,9 @@ func (h *Handler) Refresh(ctx context.Context) error {
 			if revision != "" && revision != result.release.Origin.Revision {
 				return errors.New("serving: preview revision does not match release")
 			}
-			if token == "" {
+			if production {
 				result.assets = retained
 			}
-			host := deploy.Host(h.config.BaseDomain, h.config.PreviewStyle, site.Name, token)
 			if !validHostname(host) {
 				return errors.New("serving: invalid generated hostname")
 			}
@@ -162,11 +172,11 @@ func (h *Handler) Refresh(ctx context.Context) error {
 			next.routes[host] = result
 			return nil
 		}
-		if err := add("", site.Production, ""); err != nil {
+		if err := add(deploy.Host(h.config.BaseDomain, h.config.PreviewStyle, site.Name, ""), site.Production, "", true); err != nil {
 			return err
 		}
-		for token, alias := range site.Aliases {
-			if err := add(token, alias.Release, alias.Revision); err != nil {
+		for _, preview := range bySite[site.Name] {
+			if err := add(preview.Host, preview.Alias.Release, preview.Alias.Revision, false); err != nil {
 				return err
 			}
 		}

@@ -2,6 +2,7 @@ listen: ":8080"
 api_listen: "127.0.0.1:50051"
 base_domain: example.com
 preview_style: flat
+preview_alias_mode: qualified # tag-first: readable tag names, then branch fallback
 refresh_interval: 5s
 storage:
   bucket: page

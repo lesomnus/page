@@ -29,7 +29,7 @@ func TestConfigurationAndRedaction(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "never-print-this")
 	file := configFile(t, "base_domain: example.com\nrefresh_interval: 2s\ngithub:\n  - id: source\n    owner: org\n")
 	c, e := Load(file)
-	if e != nil || c.RefreshInterval != 2*time.Second || c.GitHub[0].Token != "never-print-this" {
+	if e != nil || c.RefreshInterval != 2*time.Second || c.GitHub[0].Token != "never-print-this" || c.PreviewAliasMode != deploy.PreviewAliasQualified {
 		t.Fatalf("load: %v %v", c, e)
 	}
 	var out, errOut bytes.Buffer
@@ -39,10 +39,13 @@ func TestConfigurationAndRedaction(t *testing.T) {
 	if strings.Contains(out.String(), "never-print-this") || !strings.Contains(out.String(), "<redacted>") {
 		t.Fatal("token was not redacted")
 	}
-	for _, bad := range []string{"typo: true\n", "base_domain: example.com\n---\nlisten: ':99'\n", "github:\n - id: same\n - id: same\n"} {
+	for _, bad := range []string{"typo: true\n", "base_domain: example.com\n---\nlisten: ':99'\n", "github:\n - id: same\n - id: same\n", "preview_alias_mode: unknown\n"} {
 		if _, e = Load(configFile(t, bad)); e == nil {
 			t.Fatalf("accepted config: %q", bad)
 		}
+	}
+	if c, e = Load(configFile(t, "preview_alias_mode: tag-first\n")); e != nil || c.PreviewAliasMode != deploy.PreviewAliasTagFirst {
+		t.Fatalf("tag-first config: %#v %v", c, e)
 	}
 	if e = Run(context.Background(), []string{"serve", "--once", "--config", file}, &out, &errOut); e == nil {
 		t.Fatal("accepted once on serve")

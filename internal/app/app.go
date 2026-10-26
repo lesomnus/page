@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
 	"time"
 
 	"github.com/lesomnus/page/internal/api"
@@ -28,17 +27,18 @@ import (
 )
 
 type Config struct {
-	Listen          string              `yaml:"listen"`
-	APIListen       string              `yaml:"api_listen"`
-	BaseDomain      string              `yaml:"base_domain"`
-	PreviewStyle    string              `yaml:"preview_style"`
-	RefreshInterval time.Duration       `yaml:"refresh_interval"`
-	Storage         storage.S3Config    `yaml:"storage"`
-	GitHub          []githubsync.Config `yaml:"github"`
+	Listen           string              `yaml:"listen"`
+	APIListen        string              `yaml:"api_listen"`
+	BaseDomain       string              `yaml:"base_domain"`
+	PreviewStyle     string              `yaml:"preview_style"`
+	PreviewAliasMode string              `yaml:"preview_alias_mode"`
+	RefreshInterval  time.Duration       `yaml:"refresh_interval"`
+	Storage          storage.S3Config    `yaml:"storage"`
+	GitHub           []githubsync.Config `yaml:"github"`
 }
 
 func Load(name string) (Config, error) {
-	c := Config{Listen: ":8080", APIListen: "127.0.0.1:50051", BaseDomain: "example.com", PreviewStyle: "flat", RefreshInterval: 5 * time.Second}
+	c := Config{Listen: ":8080", APIListen: "127.0.0.1:50051", BaseDomain: "example.com", PreviewStyle: "flat", PreviewAliasMode: deploy.PreviewAliasQualified, RefreshInterval: 5 * time.Second}
 	f, e := os.Open(name)
 	if e != nil {
 		return c, e
@@ -52,6 +52,10 @@ func Load(name string) (Config, error) {
 	var extra any
 	if e = d.Decode(&extra); e != io.EOF {
 		return c, errors.New("configuration must contain one YAML document")
+	}
+	c.PreviewAliasMode, e = deploy.PreviewAliasMode(c.PreviewAliasMode)
+	if e != nil {
+		return c, e
 	}
 	seen := map[string]bool{}
 	for i := range c.GitHub {
@@ -189,7 +193,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 }
 
 func Serve(ctx context.Context, c Config, catalog *deploy.Catalog) error {
-	h, e := serving.New(catalog, serving.Config{BaseDomain: c.BaseDomain, PreviewStyle: c.PreviewStyle, RefreshInterval: c.RefreshInterval})
+	h, e := serving.New(catalog, serving.Config{BaseDomain: c.BaseDomain, PreviewStyle: c.PreviewStyle, PreviewAliasMode: c.PreviewAliasMode, RefreshInterval: c.RefreshInterval})
 	if e != nil {
 		return e
 	}
@@ -211,7 +215,7 @@ func Serve(ctx context.Context, c Config, catalog *deploy.Catalog) error {
 	}
 	g, runCtx := errgroup.WithContext(ctx)
 	server := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
-	slog.InfoContext(ctx, "serving static sites", "address", l.Addr().String(), "base_domain", c.BaseDomain, "preview_style", c.PreviewStyle)
+	slog.InfoContext(ctx, "serving static sites", "address", l.Addr().String(), "base_domain", c.BaseDomain, "preview_style", c.PreviewStyle, "preview_alias_mode", c.PreviewAliasMode)
 	g.Go(func() error { return h.Run(runCtx) })
 	g.Go(func() error { return serveHTTP(runCtx, server, l) })
 	if apiListener != nil {
@@ -271,6 +275,10 @@ func Status(ctx context.Context, c Config, cat *deploy.Catalog, out io.Writer) e
 	if e != nil {
 		return e
 	}
+	plan, e := deploy.PlanPreviews(sites, c.BaseDomain, c.PreviewStyle, c.PreviewAliasMode)
+	if e != nil {
+		return e
+	}
 	type preview struct {
 		Kind     string `json:"kind"`
 		Ref      string `json:"ref"`
@@ -278,14 +286,15 @@ func Status(ctx context.Context, c Config, cat *deploy.Catalog, out io.Writer) e
 		URL      string `json:"url"`
 	}
 	type site struct {
-		Name       string               `json:"name"`
-		Owner      string               `json:"owner"`
-		Production string               `json:"productionRelease"`
-		URL        string               `json:"url"`
-		Previews   []preview            `json:"previews"`
-		History    []string             `json:"history,omitempty"`
-		Assets     map[string]time.Time `json:"assetReleases,omitempty"`
-		Control    controlStatus        `json:"control"`
+		Name            string                  `json:"name"`
+		Owner           string                  `json:"owner"`
+		Production      string                  `json:"productionRelease"`
+		URL             string                  `json:"url"`
+		Previews        []preview               `json:"previews"`
+		History         []string                `json:"history,omitempty"`
+		Assets          map[string]time.Time    `json:"assetReleases,omitempty"`
+		Control         controlStatus           `json:"control"`
+		PreviewProblems []deploy.PreviewProblem `json:"previewProblems,omitempty"`
 	}
 	result := []site{}
 	for _, s := range sites {
@@ -296,14 +305,16 @@ func Status(ctx context.Context, c Config, cat *deploy.Catalog, out io.Writer) e
 		if e != nil {
 			return e
 		}
-		tokens := make([]string, 0, len(s.Aliases))
-		for token := range s.Aliases {
-			tokens = append(tokens, token)
+		for _, route := range plan.Routes {
+			if route.Site == s.Name && route.Primary {
+				a := route.Alias
+				x.Previews = append(x.Previews, preview{a.Kind, a.Name, a.Revision, "https://" + route.Host})
+			}
 		}
-		sort.Strings(tokens)
-		for _, token := range tokens {
-			a := s.Aliases[token]
-			x.Previews = append(x.Previews, preview{a.Kind, a.Name, a.Revision, "https://" + deploy.Host(c.BaseDomain, c.PreviewStyle, s.Name, token)})
+		for _, problem := range plan.Problems {
+			if problem.Site == s.Name {
+				x.PreviewProblems = append(x.PreviewProblems, problem)
+			}
 		}
 		result = append(result, x)
 	}
