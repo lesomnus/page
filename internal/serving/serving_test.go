@@ -223,7 +223,7 @@ func TestInvalidPathsAndMethods(t *testing.T) {
 	if w.Code != 405 || w.Header().Get("Allow") != "GET, HEAD" {
 		t.Fatalf("unexpected method response: %d", w.Code)
 	}
-	for _, cfg := range []Config{{BaseDomain: ""}, {BaseDomain: "evil/host"}, {BaseDomain: "example.com", PreviewStyle: "unknown"}, {BaseDomain: "example.com", RefreshInterval: -time.Second}} {
+	for _, cfg := range []Config{{BaseDomain: ""}, {BaseDomain: "evil/host"}, {BaseDomain: "example.com", PreviewStyle: "unknown"}, {BaseDomain: "example.com", PreviewAliasMode: "unknown"}, {BaseDomain: "example.com", RefreshInterval: -time.Second}} {
 		if _, err := New(c, cfg); err == nil {
 			t.Fatalf("accepted config %+v", cfg)
 		}
