@@ -61,6 +61,11 @@ go run ./cmd/page version
 `--config`는 명령 앞뒤에 둘 수 있으며 기본 파일은 `page.yaml`이다. `serve`는
 GitHub에 접속하지 않는다. sync가 중단되어도 이미 게시한 사이트는 계속 제공한다.
 
+`run`에서는 `site.json` 게시 완료 알림으로 서빙 상태를 바로 갱신한다. 불변 release
+메타데이터와 라우팅 엔진은 재사용하고, 기본 5분마다 목록·ETag를 확인해 놓친 변경을
+복구한다. GitHub webhook을 켜면 push·branch/tag 생성·삭제가 source sync도 깨운다.
+별도 프로세스에서 쓴 변경은 각 polling 주기로 발견한다. [알림 설정과 동작](docs/mvp.md#변경-알림과-재확인)을 참고한다.
+
 ## 라우팅과 배포 제어
 
 게시 디렉터리 루트의 `pages.json`으로 rewrite·내부 redirect·clean URL·SPA fallback·

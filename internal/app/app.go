@@ -33,12 +33,14 @@ type Config struct {
 	PreviewStyle     string              `yaml:"preview_style"`
 	PreviewAliasMode string              `yaml:"preview_alias_mode"`
 	RefreshInterval  time.Duration       `yaml:"refresh_interval"`
+	WebhookListen    string              `yaml:"webhook_listen"`
+	WebhookSecret    string              `yaml:"webhook_secret"`
 	Storage          storage.S3Config    `yaml:"storage"`
 	GitHub           []githubsync.Config `yaml:"github"`
 }
 
 func Load(name string) (Config, error) {
-	c := Config{Listen: ":8080", APIListen: "127.0.0.1:50051", BaseDomain: "example.com", PreviewStyle: "flat", PreviewAliasMode: deploy.PreviewAliasQualified, RefreshInterval: 5 * time.Second}
+	c := Config{Listen: ":8080", APIListen: "127.0.0.1:50051", BaseDomain: "example.com", PreviewStyle: "flat", PreviewAliasMode: deploy.PreviewAliasQualified, RefreshInterval: 5 * time.Minute}
 	f, e := os.Open(name)
 	if e != nil {
 		return c, e
@@ -56,6 +58,14 @@ func Load(name string) (Config, error) {
 	c.PreviewAliasMode, e = deploy.PreviewAliasMode(c.PreviewAliasMode)
 	if e != nil {
 		return c, e
+	}
+	if c.WebhookSecret == "" {
+		c.WebhookSecret = os.Getenv("GITHUB_WEBHOOK_SECRET")
+	} else {
+		c.WebhookSecret = os.ExpandEnv(c.WebhookSecret)
+	}
+	if c.WebhookListen != "" && c.WebhookSecret == "" {
+		return c, errors.New("webhook_secret or GITHUB_WEBHOOK_SECRET is required when webhook_listen is enabled")
 	}
 	seen := map[string]bool{}
 	for i := range c.GitHub {
@@ -133,6 +143,9 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		return fmt.Errorf("load config: %w", e)
 	}
 	if command == "config" {
+		if c.WebhookSecret != "" {
+			c.WebhookSecret = "<redacted>"
+		}
 		for i := range c.GitHub {
 			if c.GitHub[i].Token != "" {
 				c.GitHub[i].Token = "<redacted>"
@@ -178,7 +191,25 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		}
 		return errors.Join(failures...)
 	}
+	var webhookListener net.Listener
+	var webhookServer *http.Server
+	if command != "serve" && c.WebhookListen != "" {
+		handler, e := githubWebhookHandler(c.WebhookSecret, syncs)
+		if e != nil {
+			return e
+		}
+		webhookListener, e = net.Listen("tcp", c.WebhookListen)
+		if e != nil {
+			return fmt.Errorf("listen for GitHub webhooks: %w", e)
+		}
+		defer webhookListener.Close()
+		webhookServer = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+	}
 	g, runCtx := errgroup.WithContext(ctx)
+	if webhookListener != nil {
+		slog.InfoContext(ctx, "receiving GitHub webhooks", "address", webhookListener.Addr().String())
+		g.Go(func() error { return serveHTTP(runCtx, webhookServer, webhookListener) })
+	}
 	for _, s := range syncs {
 		g.Go(func() error { return s.Run(runCtx) })
 	}

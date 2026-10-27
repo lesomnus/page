@@ -47,6 +47,7 @@ type Sync struct {
 	pattern *regexp.Regexp
 	client  *http.Client
 	mu      sync.Mutex
+	wake    chan struct{}
 	now     func() time.Time
 }
 
@@ -131,24 +132,13 @@ func New(catalog *deploy.Catalog, cfg Config) (*Sync, error) {
 		}
 		return nil
 	}}
-	return &Sync{cat: catalog, cfg: cfg, pattern: pattern, client: client, now: func() time.Time { return time.Now().UTC() }}, nil
+	return &Sync{cat: catalog, cfg: cfg, pattern: pattern, client: client, wake: make(chan struct{}, 1), now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
-// Run scans immediately and then polls. An unsuccessful pass retains the last
-// successful publication, logs its error, and is retried on the next interval.
+// Run scans immediately, then reconciles notifications and periodic polling.
+// Notifications are hints; Once always reads the authoritative source state.
 func (s *Sync) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.PollInterval)
-	defer ticker.Stop()
-	for {
-		if err := s.Once(ctx); err != nil && ctx.Err() == nil {
-			slog.ErrorContext(ctx, "GitHub sync failed", "source", s.cfg.ID, "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	return s.run(ctx)
 }
 
 // Once performs a complete repository listing before changing any publication.

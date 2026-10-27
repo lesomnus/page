@@ -3,7 +3,10 @@ api_listen: "127.0.0.1:50051"
 base_domain: example.com
 preview_style: flat
 preview_alias_mode: qualified # tag-first: readable tag names, then branch fallback
-refresh_interval: 5s
+refresh_interval: 5m
+# Optional signed GitHub notifications; run/sync only, disabled by default.
+# webhook_listen: "127.0.0.1:8081"
+# webhook_secret: ${GITHUB_WEBHOOK_SECRET}
 storage:
   bucket: page
   prefix: page
