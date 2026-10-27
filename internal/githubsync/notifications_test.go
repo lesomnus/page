@@ -153,7 +153,13 @@ func TestPermissionFailureWaitsForNotificationOrPolling(t *testing.T) {
 }
 
 func TestControlWriteWakesOwningSource(t *testing.T) {
-	_, server := fixture(t)
+	forge, _ := fixture(t)
+	var apiCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiCalls.Add(1)
+		forge.ServeHTTP(w, r)
+	}))
+	defer server.Close()
 	cat := deploy.New(storage.NewMemory())
 	s, err := New(cat, Config{ID: "source", Owner: "acme", APIURL: server.URL, PollInterval: time.Hour, Branches: []string{"main"}, RecentCommits: 1})
 	if err != nil {
@@ -175,6 +181,7 @@ func TestControlWriteWakesOwningSource(t *testing.T) {
 	// only operator intent. The loop must wake and materialize that intent.
 	s.mu.Lock()
 	s.mu.Unlock()
+	before := apiCalls.Load()
 	if _, err := cat.RequestControl(context.Background(), "foo", "source", "disabled", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +195,11 @@ func TestControlWriteWakesOwningSource(t *testing.T) {
 			t.Fatal("control notification did not disable the publication")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	s.mu.Lock()
+	s.mu.Unlock()
+	if got := apiCalls.Load(); got != before {
+		t.Fatalf("control-only wake queried GitHub: %d -> %d", before, got)
 	}
 }
 
