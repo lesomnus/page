@@ -51,20 +51,45 @@ func TestWebhookPublishesAndRefreshesWithoutPolling(t *testing.T) {
 	var head atomic.Value
 	head.Store(firstSHA)
 	var sourceCalls atomic.Int64
+	var inventoryCalls, otherCalls atomic.Int64
+	targetStarted := make(chan struct{}, 1)
+	releaseTarget := make(chan struct{})
 	forge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sourceCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
+		requestPath := r.URL.Path
+		repositoryID, repositoryName := int64(42), "foo.hday.page"
+		currentSHA := head.Load().(string)
+		if strings.HasPrefix(requestPath, "/repos/acme/bar.hday.page") {
+			otherCalls.Add(1)
+			requestPath = strings.Replace(requestPath, "/repos/acme/bar.hday.page", "/repos/acme/foo.hday.page", 1)
+			repositoryID, repositoryName, currentSHA = 99, "bar.hday.page", firstSHA
+		}
 		switch {
-		case r.URL.Path == "/orgs/acme/repos":
-			io.WriteString(w, `[{"id":42,"name":"foo.hday.page","full_name":"acme/foo.hday.page","default_branch":"main"}]`)
-		case r.URL.Path == "/repos/acme/foo.hday.page/branches":
-			json.NewEncoder(w).Encode([]any{map[string]any{"name": "main", "commit": map[string]string{"sha": head.Load().(string)}}})
-		case strings.HasPrefix(r.URL.Path, "/repos/acme/foo.hday.page/commits/"):
-			json.NewEncoder(w).Encode(map[string]any{"sha": head.Load().(string), "parents": []any{}})
-		case r.URL.Path == "/repos/acme/foo.hday.page/contents/page.yaml":
+		case requestPath == "/orgs/acme/repos":
+			inventoryCalls.Add(1)
+			io.WriteString(w, `[{"id":42,"name":"foo.hday.page","full_name":"acme/foo.hday.page","default_branch":"main"},{"id":99,"name":"bar.hday.page","full_name":"acme/bar.hday.page","default_branch":"main"}]`)
+		case requestPath == "/repos/acme/foo.hday.page":
+			if repositoryName == "foo.hday.page" {
+				select {
+				case targetStarted <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseTarget:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			json.NewEncoder(w).Encode(map[string]any{"id": repositoryID, "name": repositoryName, "full_name": "acme/" + repositoryName, "default_branch": "main"})
+		case requestPath == "/repos/acme/foo.hday.page/branches":
+			json.NewEncoder(w).Encode([]any{map[string]any{"name": "main", "commit": map[string]string{"sha": currentSHA}}})
+		case strings.HasPrefix(requestPath, "/repos/acme/foo.hday.page/commits/"):
+			json.NewEncoder(w).Encode(map[string]any{"sha": currentSHA, "parents": []any{}})
+		case requestPath == "/repos/acme/foo.hday.page/contents/page.yaml":
 			io.WriteString(w, "schemaVersion: 1\npublish:\n  directory: public\n")
-		case strings.HasPrefix(r.URL.Path, "/repos/acme/foo.hday.page/tarball/"):
-			if body, ok := archives[strings.TrimPrefix(r.URL.Path, "/repos/acme/foo.hday.page/tarball/")]; ok {
+		case strings.HasPrefix(requestPath, "/repos/acme/foo.hday.page/tarball/"):
+			if body, ok := archives[strings.TrimPrefix(requestPath, "/repos/acme/foo.hday.page/tarball/")]; ok {
 				w.Write(body)
 			} else {
 				http.NotFound(w, r)
@@ -90,13 +115,13 @@ func TestWebhookPublishesAndRefreshesWithoutPolling(t *testing.T) {
 	// A non-503 response proves startup recovery and subscription have completed
 	// before the source's first publication is allowed to happen.
 	client := &http.Client{Timeout: time.Second}
-	read := func() (int, string) {
+	readHost := func(host string) (int, string) {
 		t.Helper()
 		r, err := http.NewRequestWithContext(ctx, http.MethodGet, readerHTTP.URL+"/", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		r.Host = "foo.example.com"
+		r.Host = host
 		response, err := client.Do(r)
 		if err != nil {
 			t.Fatal(err)
@@ -108,6 +133,7 @@ func TestWebhookPublishesAndRefreshesWithoutPolling(t *testing.T) {
 		}
 		return response.StatusCode, string(body)
 	}
+	read := func() (int, string) { return readHost("foo.example.com") }
 	await := func(condition func() bool) {
 		t.Helper()
 		for !condition() {
@@ -134,6 +160,11 @@ func TestWebhookPublishesAndRefreshesWithoutPolling(t *testing.T) {
 		}
 	})
 	await(func() bool { code, body := read(); return code == http.StatusOK && body == "version one" })
+	await(func() bool {
+		code, body := readHost("bar.example.com")
+		return code == http.StatusOK && body == "version one"
+	})
+	beforeInventory, beforeOther := inventoryCalls.Load(), otherCalls.Load()
 	first, err := cat.GetSite(ctx, "foo")
 	if err != nil {
 		t.Fatal(err)
@@ -187,6 +218,18 @@ func TestWebhookPublishesAndRefreshesWithoutPolling(t *testing.T) {
 	if code := deliver("acme/foo.hday.page", true); code != http.StatusAccepted {
 		t.Fatalf("valid delivery rejected: %d", code)
 	}
+	select {
+	case <-targetStarted:
+	case <-ctx.Done():
+		t.Fatal("repository notification did not fetch only its target metadata")
+	}
+	// The source's writer lock now belongs to the target job: startup has
+	// finished all of bar's publication/GC writes, while foo is still blocked.
+	otherBefore, err := cat.Store.Stat(ctx, deploy.SiteKey("bar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(releaseTarget)
 	await(func() bool { code, body := read(); return code == http.StatusOK && body == "version two" })
 	second, err := cat.GetSite(ctx, "foo")
 	if err != nil || second.Production == first.Production {
@@ -195,5 +238,15 @@ func TestWebhookPublishesAndRefreshesWithoutPolling(t *testing.T) {
 	release, err := cat.GetRelease(ctx, second.Owner, second.Name, second.Production)
 	if err != nil || release.Origin.Revision != secondSHA {
 		t.Fatalf("payload revision overrode current source state: %#v %v", release, err)
+	}
+	if inventoryCalls.Load() != beforeInventory || otherCalls.Load() != beforeOther {
+		t.Fatal("repository webhook traversed the inventory or queried an unrelated repository")
+	}
+	otherAfter, err := cat.Store.Stat(ctx, deploy.SiteKey("bar"))
+	if err != nil || otherAfter.ETag != otherBefore.ETag {
+		t.Fatalf("repository webhook rewrote an unrelated publication: %v", err)
+	}
+	if code, body := readHost("bar.example.com"); code != http.StatusOK || body != "version one" {
+		t.Fatalf("repository webhook changed another site's serving: %d %q", code, body)
 	}
 }
