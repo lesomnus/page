@@ -63,7 +63,8 @@ GitHub에 접속하지 않는다. sync가 중단되어도 이미 게시한 사�
 
 `run`에서는 `site.json` 게시 완료 알림으로 서빙 상태를 바로 갱신한다. 불변 release
 메타데이터와 라우팅 엔진은 재사용하고, 기본 5분마다 목록·ETag를 확인해 놓친 변경을
-복구한다. GitHub webhook을 켜면 push·branch/tag 생성·삭제가 source sync도 깨운다.
+복구한다. GitHub webhook의 push·branch/tag 생성·삭제는 해당 저장소만 동기화한다.
+전체 저장소 탐색은 시작·정기 polling 때 수행한다.
 별도 프로세스에서 쓴 변경은 각 polling 주기로 발견한다. [알림 설정과 동작](docs/mvp.md#변경-알림과-재확인)을 참고한다.
 
 ## 라우팅과 배포 제어

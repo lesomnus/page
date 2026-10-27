@@ -42,13 +42,16 @@ type Config struct {
 }
 
 type Sync struct {
-	cat     *deploy.Catalog
-	cfg     Config
-	pattern *regexp.Regexp
-	client  *http.Client
-	mu      sync.Mutex
-	wake    chan struct{}
-	now     func() time.Time
+	cat                 *deploy.Catalog
+	cfg                 Config
+	pattern             *regexp.Regexp
+	client              *http.Client
+	mu                  sync.Mutex
+	wake                chan struct{}
+	pendingMu           sync.Mutex
+	pendingFull         bool
+	pendingRepositories map[string]string
+	now                 func() time.Time
 }
 
 func New(catalog *deploy.Catalog, cfg Config) (*Sync, error) {

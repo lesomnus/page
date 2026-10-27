@@ -96,7 +96,8 @@ publish:
 그 파일만 읽는다. 새 배포 파일은 `page.yaml`을 사용한다.
 빌드를 실행하지 않으며 게시 디렉터리의 symlink·특수 파일·경로 탈출을 거부한다.
 
-시작 시 전체 목록을 탐색하고 polling 및 설정한 webhook으로 반복한다. 필요한 저장소·ref 목록과
+시작·정기 polling 때는 전체 저장소 목록을 탐색한다. 설정한 webhook은 알림에 지정된
+저장소만 다시 동기화한다. 필요한 저장소·ref 목록과
 그래프 조회가 성공한 결과를 기준으로 사이트를 갱신한다. 선택한 커밋을 임시 디스크에
 내려받아 검증하고 파일 업로드 뒤 manifest를 작성한다. 마지막에 작은 사이트 공개
 참조 객체를 교체한다. 미완성 업로드는 공개되지 않으며 실패 시 이전 성공 배포를 유지한다.
@@ -350,15 +351,18 @@ GitHub 저장소 또는 조직 webhook에 다음을 설정한다.
 - Events: `push`, `create`, `delete`, `repository`. 생성 시 `ping`도 지원한다.
 
 receiver는 원문 body의 `X-Hub-Signature-256` HMAC-SHA256을 확인하고 2 MiB를 넘는
-body는 거부한다. 설정한 owner·저장소 이름 규칙에 맞는 이벤트만 소유 sync를 깨운다.
-payload의 SHA나 파일을 직접 게시하지 않고 GitHub의 현재 상태를 다시 읽어 manifest·ref 정책을
-적용한다. 서명 검증 방식은 [GitHub 공식 안내](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)를 따른다.
+body는 거부한다. 설정한 owner·저장소 이름 규칙에 맞는 이벤트는 해당 저장소만 동기화한다.
+GitHub에서 그 저장소의 현재 ID·소유자·이름을 다시 확인하고 manifest·ref 정책을 적용한다.
+payload의 SHA나 파일을 직접 게시하지 않으며 다른 저장소의 ref·게시 상태·GC를 조회하거나
+갱신하지 않는다. 서명 검증 방식은 [GitHub 공식 안내](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)를 따른다.
 
-알림은 상태를 다시 읽으라는 힌트이며 중복은 합쳐 처리한다. 실행 중 들어온 알림은 후속 실행을
-위해 남긴다. GitHub 이벤트를 놓치거나 너무 커서 거부했을 때는 소스의 `poll_interval`로 복구한다.
+알림은 상태를 다시 읽으라는 힌트이며 같은 저장소의 중복은 합쳐 처리한다. 서로 다른 저장소의
+알림과 실행 중 들어온 알림은 각각 후속 실행을 위해 남긴다. 실패 재시도도 실패한 대상만 처리한다.
+GitHub 이벤트를 놓치거나 너무 커서 거부했을 때는 소스의 `poll_interval` 전체 탐색으로 복구한다.
 이 주기와 서빙의 `refresh_interval`은 별개다.
 
-같은 Catalog에서 기록한 제어 의도는 소유 sync를 깨우지만, 별도 CLI 프로세스가 쓴
+같은 Catalog에서 기록한 제어 의도는 소유 sync의 제어 반영만 깨우고 GitHub 전체 탐색을
+실행하지 않는다. 별도 CLI 프로세스가 쓴
 `control.json`은 소유 sync의 다음 polling에서 적용한다. `sync`와 `serve`를 별도 프로세스로
 운영하면 게시 알림도 공유되지 않으므로 서빙 반영은 다음 `refresh_interval`에 이루어진다.
 프로세스 사이 알림 전달은 별도 연결이 필요하다.
