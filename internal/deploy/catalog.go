@@ -25,22 +25,27 @@ func validPath(p string) bool {
 }
 
 func (c *Catalog) read(ctx context.Context, key string, v any) error {
-	r, _, err := c.Store.Get(ctx, key)
+	_, err := c.readInfo(ctx, key, v)
+	return err
+}
+
+func (c *Catalog) readInfo(ctx context.Context, key string, v any) (storage.Info, error) {
+	r, info, err := c.Store.Get(ctx, key)
 	if err != nil {
-		return err
+		return storage.Info{}, err
 	}
 	defer r.Close()
 	b, err := io.ReadAll(io.LimitReader(r, maxMetadata+1))
 	if err != nil {
-		return err
+		return storage.Info{}, err
 	}
 	if len(b) > maxMetadata {
-		return fmt.Errorf("%w: metadata too large", ErrInvalid)
+		return storage.Info{}, fmt.Errorf("%w: metadata too large", ErrInvalid)
 	}
 	if err = json.Unmarshal(b, v); err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrInvalid, key, err)
+		return storage.Info{}, fmt.Errorf("%w: %s: %v", ErrInvalid, key, err)
 	}
-	return nil
+	return info, nil
 }
 
 func (c *Catalog) write(ctx context.Context, key string, v any) error {
@@ -52,7 +57,11 @@ func (c *Catalog) write(ctx context.Context, key string, v any) error {
 		return fmt.Errorf("%w: metadata too large", ErrInvalid)
 	}
 	_, err = c.Store.Put(ctx, key, strings.NewReader(string(b)), int64(len(b)), "application/json")
-	return err
+	if err != nil {
+		return err
+	}
+	c.notifyWrite(key)
+	return nil
 }
 
 func validateSite(s *Site) error {
@@ -107,26 +116,8 @@ func validateRelease(r *Release) error {
 }
 
 func (c *Catalog) GetSite(ctx context.Context, name string) (*Site, error) {
-	if !ValidName(name) {
-		return nil, ErrInvalid
-	}
-	var s Site
-	if err := c.read(ctx, SiteKey(name), &s); err != nil {
-		return nil, err
-	}
-	if err := validateSite(&s); err != nil {
-		return nil, err
-	}
-	if s.Name != name {
-		return nil, ErrInvalid
-	}
-	if s.Aliases == nil {
-		s.Aliases = map[string]Alias{}
-	}
-	if s.Retired == nil {
-		s.Retired = map[string]time.Time{}
-	}
-	return &s, nil
+	s, _, err := c.GetSiteInfo(ctx, name)
+	return s, err
 }
 
 func (c *Catalog) list(ctx context.Context, prefix string) ([]storage.Info, error) {
@@ -151,18 +142,14 @@ func (c *Catalog) list(ctx context.Context, prefix string) ([]storage.Info, erro
 }
 
 func (c *Catalog) ListSites(ctx context.Context) ([]*Site, error) {
-	objects, err := c.list(ctx, "sites/")
+	objects, err := c.ListSiteObjects(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var out []*Site
 	for _, o := range objects {
-		rest := strings.TrimPrefix(o.Key, "sites/")
-		parts := strings.Split(rest, "/")
-		if len(parts) != 2 || parts[1] != "site.json" {
-			continue
-		}
-		s, err := c.GetSite(ctx, parts[0])
+		name := strings.TrimSuffix(strings.TrimPrefix(o.Key, "sites/"), "/site.json")
+		s, err := c.GetSite(ctx, name)
 		if err != nil {
 			return nil, err
 		}

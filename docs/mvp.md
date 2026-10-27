@@ -27,7 +27,7 @@ api_listen: "127.0.0.1:50051"
 base_domain: example.com
 preview_style: flat
 preview_alias_mode: qualified
-refresh_interval: 5s
+refresh_interval: 5m
 storage:
   bucket: page
   prefix: page
@@ -96,7 +96,7 @@ publish:
 그 파일만 읽는다. 새 배포 파일은 `page.yaml`을 사용한다.
 빌드를 실행하지 않으며 게시 디렉터리의 symlink·특수 파일·경로 탈출을 거부한다.
 
-시작 시 전체 목록을 탐색하고 polling으로 반복한다. 필요한 저장소·ref 목록과
+시작 시 전체 목록을 탐색하고 polling 및 설정한 webhook으로 반복한다. 필요한 저장소·ref 목록과
 그래프 조회가 성공한 결과를 기준으로 사이트를 갱신한다. 선택한 커밋을 임시 디스크에
 내려받아 검증하고 파일 업로드 뒤 manifest를 작성한다. 마지막에 작은 사이트 공개
 참조 객체를 교체한다. 미완성 업로드는 공개되지 않으며 실패 시 이전 성공 배포를 유지한다.
@@ -222,8 +222,10 @@ go run ./cmd/page remove foo
 명령은 기본적으로 요청 저장 직후 JSON을 출력한다. `controlApplied: false`이면
 소유 sync가 아직 반영하지 않은 상태다. `--wait 90s`는 적용 확인까지 기다리며
 시간이 지나도 저장한 요청은 유지된다. 비활성 sync의 요청은 대기 상태로 남는다.
-제어 의도와 게시 상태는 `status`의 `control`에서도 볼 수 있다. 데이터 평면은 반영된
-사이트 metadata를 `refresh_interval`에 따라 읽으므로 적용 뒤에도 이 지연이 있다.
+제어 의도와 게시 상태는 `status`의 `control`에서도 볼 수 있다. 데이터 평면은 소유 sync가
+반영한 사이트 메타데이터를 읽는다. 같은 `run` 프로세스에서는 사이트 게시 완료 알림으로
+서빙을 갱신한다. 별도 프로세스의
+변경이나 놓친 알림은 `refresh_interval`에 따라 재확인한다.
 
 `--config`, `--source`, `--wait`는 명령의 위치 인자 앞뒤에 둘 수 있다. `--source`는
 사이트 소유 ID를 검증하며 생략하면 기존 소유자를 사용한다. 제어 API는 별도 인증
@@ -312,12 +314,65 @@ HTML·XHTML·pages.json은 확장자와 MIME을 검사해 제외한다. 운영 �
 객체가 아직 Storage에 남아 있어도 만료된 자산을 응답하지 않는다. `gc_grace`는
 서빙 metadata 재조회와 진행 중 다운로드를 위한 별도의 삭제 유예다.
 
+## 변경 알림과 재확인
+
+`refresh_interval`의 기본값은 5분이다. 서빙 프로세스는 시작 시 즉시 전체 게시 상태를 읽고,
+같은 프로세스에서 `site.json` 저장이 성공하면 알림으로 다시 확인한다. 5분 주기 조회는
+알림 유실이나 다른 프로세스의 게시를 발견하는 복구 경로다.
+
+불변 release manifest와 컴파일한 라우팅 엔진은 `(owner, site, id)`로 캐시한다.
+`site.json`은 목록의 ETag가 바뀐 것만 다시 읽고 GET 본문과 해당 응답의 ETag를 함께 보관한다.
+ETag가 없는 Storage에서는 GET으로 확인한다. 객체가 변경되지 않은 refresh의 Storage 요청은
+목록 페이지 수만큼의 LIST뿐이다. sync는 ref가 같아도 게시 점검 시각을 저장할 수 있으므로
+그때는 해당 `site.json`을 다시 읽는다.
+
+새 라우팅과 캐시는 전체 조회·검증 성공 후 함께 교체한다. 실패하면 이전 snapshot을 유지하고
+1·2·4초 간격으로 최대 세 번 빠르게 재시도한 뒤 새 알림이나 정기 재확인을 기다린다.
+현재 운영·preview·만료 전 이전 자산에서 참조하지 않는 release
+캐시는 제거하며, 자산 만료는 여전히 HTTP 요청마다 확인한다.
+
+GitHub 이벤트로 소유 sync를 깨우려면 `run` 또는 지속 실행하는 `sync`에 별도 listener를 켠다.
+
+```yaml
+webhook_listen: ":8081"
+webhook_secret: "${GITHUB_WEBHOOK_SECRET}"
+```
+
+listener는 기본적으로 꺼져 있다. `webhook_secret`을 생략하면 같은 이름의 환경 변수
+`GITHUB_WEBHOOK_SECRET`을 사용하며, listener를 켤 때 비어 있으면 시작을 거부한다.
+`page config`는 이 값을 가린다. `serve`와 `sync --once`는 webhook listener를 열지 않는다.
+
+GitHub 저장소 또는 조직 webhook에 다음을 설정한다.
+
+- URL: 외부 HTTPS reverse proxy가 webhook listener로 전달하는 `/webhooks/github`.
+- Content type: `application/json`.
+- Secret: 서버의 `GITHUB_WEBHOOK_SECRET`과 같은 값.
+- Events: `push`, `create`, `delete`, `repository`. 생성 시 `ping`도 지원한다.
+
+receiver는 원문 body의 `X-Hub-Signature-256` HMAC-SHA256을 확인하고 2 MiB를 넘는
+body는 거부한다. 설정한 owner·저장소 이름 규칙에 맞는 이벤트만 소유 sync를 깨운다.
+payload의 SHA나 파일을 직접 게시하지 않고 GitHub의 현재 상태를 다시 읽어 manifest·ref 정책을
+적용한다. 서명 검증 방식은 [GitHub 공식 안내](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)를 따른다.
+
+알림은 상태를 다시 읽으라는 힌트이며 중복은 합쳐 처리한다. 실행 중 들어온 알림은 후속 실행을
+위해 남긴다. GitHub 이벤트를 놓치거나 너무 커서 거부했을 때는 소스의 `poll_interval`로 복구한다.
+이 주기와 서빙의 `refresh_interval`은 별개다.
+
+같은 Catalog에서 기록한 제어 의도는 소유 sync를 깨우지만, 별도 CLI 프로세스가 쓴
+`control.json`은 소유 sync의 다음 polling에서 적용한다. `sync`와 `serve`를 별도 프로세스로
+운영하면 게시 알림도 공유되지 않으므로 서빙 반영은 다음 `refresh_interval`에 이루어진다.
+프로세스 사이 알림 전달은 별도 연결이 필요하다.
+
+외부 proxy는 webhook의 정확한 경로만 listener로 전달한다. 정적 사이트·gRPC 관리 경로는
+이 webhook 경로에 포함하지 않는다. `gc_grace`는 알림을 놓쳤을 때의 서빙 재확인 주기와
+조회·진행 중 다운로드 시간을 넘도록 설정한다.
+
 ## HTTP와 DNS/TLS
 
 Host를 정확히 매칭하고 GET/HEAD, directory index, MIME, ETag/Last-Modified,
 단일·multipart Range와 404를 지원한다. 한 요청은 하나의 release snapshot에 고정한다.
-`Cache-Control: no-cache`로 재검증을 요구하며 metadata는 `refresh_interval`마다
-다시 읽는다. 조회 실패 시 마지막으로 완전히 읽은 라우팅 snapshot을 유지한다.
+`Cache-Control: no-cache`로 재검증을 요구한다. 게시 알림과 `refresh_interval`에 따른
+메타데이터 갱신은 [변경 알림과 재확인](#변경-알림과-재확인)을 따른다.
 
 기존 DNS의 `*.example.com`을 HTTP 서버/LB로 연결한다. flat preview는 같은
 `*.example.com` 인증서로 처리할 수 있다. nested preview는 앱별
@@ -379,7 +434,7 @@ CI와 `scripts/test-s3.sh`에 포함한다.
 
 ## 후속 범위
 
-OCI sync, 다른 Git forge, webhook, FS/CephFS backend, 외부 redirect·proxy,
+OCI sync, 다른 Git forge, FS/CephFS backend, 외부 redirect·proxy,
 임의 revision의 요청 시 게시, 공유 blob 중복 제거, 복수 소유자, SaaS·관리 콘솔과
 분산 전역 일관성은 포함하지 않는다. OCI 추가 시에는 OCI 고유의 tag/digest와 정책을
 구현하고 공통 게시·Storage·서빙 경계에 연결한다.

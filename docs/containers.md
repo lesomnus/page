@@ -37,6 +37,15 @@ two writers even with one replica. For independent serving availability, run
 process needs object read/list access; sync also needs write/delete and source
 credentials. Page's durable data lives in S3, so its own container needs no PVC.
 
+`run` refreshes serving state after its source commits a publication. The default
+five-minute metadata reconciliation discovers missed notifications and writes
+from other processes; unchanged releases stay cached. Optional GitHub webhooks
+use a separate `webhook_listen` port with `GITHUB_WEBHOOK_SECRET` at runtime.
+Forward only `POST /webhooks/github` to that port through HTTPS and keep the
+static-serving and gRPC routes under their existing access policy. See
+[notification configuration](mvp.md#변경-알림과-재확인) for events, limits and
+the independent source polling fallback.
+
 The server currently has no dedicated health URL. Its `/` response depends on
 the Host and published site, so an ordinary Kubernetes HTTP probe can receive
 404. A TCP startup/readiness probe on 8080 works for the serving listener.

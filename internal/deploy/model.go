@@ -99,6 +99,7 @@ type InputFile struct {
 type Catalog struct {
 	Store    storage.Store
 	mutation sync.Mutex
+	changes  changeHub
 }
 
 func New(store storage.Store) *Catalog { return &Catalog{Store: store} }

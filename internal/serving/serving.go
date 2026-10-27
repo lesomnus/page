@@ -43,12 +43,21 @@ type route struct {
 }
 type snapshot struct{ routes map[string]route }
 
+type cachedSite struct {
+	site *deploy.Site
+	etag string
+}
+
+type releaseKey struct{ owner, site, id string }
+
 type Handler struct {
-	catalog *deploy.Catalog
-	config  Config
-	refresh sync.Mutex
-	current atomic.Pointer[snapshot]
-	now     func() time.Time
+	catalog  *deploy.Catalog
+	config   Config
+	refresh  sync.Mutex
+	current  atomic.Pointer[snapshot]
+	sites    map[string]cachedSite
+	releases map[releaseKey]route
+	now      func() time.Time
 }
 
 func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
@@ -71,7 +80,7 @@ func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
 		return nil, fmt.Errorf("serving: %w", err)
 	}
 	if config.RefreshInterval == 0 {
-		config.RefreshInterval = 5 * time.Second
+		config.RefreshInterval = 5 * time.Minute
 	}
 	if config.RefreshInterval < 0 {
 		return nil, errors.New("serving: refresh_interval must be positive")
@@ -84,9 +93,24 @@ func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
 func (h *Handler) Refresh(ctx context.Context) error {
 	h.refresh.Lock()
 	defer h.refresh.Unlock()
-	sites, err := h.catalog.ListSites(ctx)
+	objects, err := h.catalog.ListSiteObjects(ctx)
 	if err != nil {
 		return fmt.Errorf("serving: list sites: %w", err)
+	}
+	nextSites := make(map[string]cachedSite, len(objects))
+	sites := make([]*deploy.Site, 0, len(objects))
+	for _, info := range objects {
+		cached, ok := h.sites[info.Key]
+		if !ok || info.ETag == "" || cached.etag == "" || info.ETag != cached.etag {
+			name := strings.TrimSuffix(strings.TrimPrefix(info.Key, "sites/"), "/site.json")
+			site, fetched, e := h.catalog.GetSiteInfo(ctx, name)
+			if e != nil {
+				return fmt.Errorf("serving: load site %s: %w", name, e)
+			}
+			cached = cachedSite{site: site, etag: fetched.ETag}
+		}
+		nextSites[info.Key] = cached
+		sites = append(sites, cached.site)
 	}
 	previews, err := deploy.PlanPreviews(sites, h.config.BaseDomain, h.config.PreviewStyle, h.config.PreviewAliasMode)
 	if err != nil {
@@ -97,6 +121,7 @@ func (h *Handler) Refresh(ctx context.Context) error {
 		bySite[preview.Site] = append(bySite[preview.Site], preview)
 	}
 	next := &snapshot{routes: make(map[string]route)}
+	nextReleases := make(map[releaseKey]route)
 	now := h.now()
 	for _, site := range sites {
 		if !deploy.ValidName(site.Name) {
@@ -105,28 +130,32 @@ func (h *Handler) Refresh(ctx context.Context) error {
 		if site.Disabled {
 			continue
 		}
-		loaded := make(map[string]route)
 		load := func(id string) (route, error) {
-			if cached, ok := loaded[id]; ok {
+			key := releaseKey{site.Owner, site.Name, id}
+			if cached, ok := nextReleases[key]; ok {
 				return cached, nil
 			}
-			rel, e := h.catalog.GetRelease(ctx, site.Owner, site.Name, id)
-			if e != nil {
-				return route{}, fmt.Errorf("serving: load release %s: %w", id, e)
+			result, ok := h.releases[key]
+			if !ok {
+				rel, e := h.catalog.GetRelease(ctx, site.Owner, site.Name, id)
+				if e != nil {
+					return route{}, fmt.Errorf("serving: load release %s: %w", id, e)
+				}
+				files := make(map[string]bool, len(rel.Files))
+				for path := range rel.Files {
+					files[path] = true
+				}
+				engine, e := routes.Compile(rel.Pages, files)
+				if e != nil {
+					return route{}, fmt.Errorf("serving: compile release %s: %w", id, e)
+				}
+				result = route{release: rel, engine: engine}
 			}
-			if !rel.Complete || rel.Site != site.Name || rel.Owner != site.Owner || rel.Origin.RepositoryID != site.RepositoryID {
+			rel := result.release
+			if !rel.Complete || rel.ID != id || rel.Site != site.Name || rel.Owner != site.Owner || rel.Origin.RepositoryID != site.RepositoryID {
 				return route{}, errors.New("serving: invalid release ownership or completion")
 			}
-			files := make(map[string]bool, len(rel.Files))
-			for path := range rel.Files {
-				files[path] = true
-			}
-			engine, e := routes.Compile(rel.Pages, files)
-			if e != nil {
-				return route{}, fmt.Errorf("serving: compile release %s: %w", id, e)
-			}
-			result := route{release: rel, engine: engine}
-			loaded[id] = result
+			nextReleases[key] = result
 			return result, nil
 		}
 		retained := []retainedAsset{}
@@ -181,28 +210,77 @@ func (h *Handler) Refresh(ctx context.Context) error {
 			}
 		}
 	}
+	// Publish caches only with a complete routing snapshot. Partial inventory or
+	// release failures must not acknowledge a fingerprint or prune old entries.
+	h.sites = nextSites
+	h.releases = nextReleases
 	h.current.Store(next)
 	return nil
 }
 
-// Run performs startup recovery and polls publication metadata. Once started,
-// refresh failures are reported while the last complete routing snapshot stays.
+// Run watches committed publications and periodically reconciles missed events.
+// Subscribe before the startup refresh so a publication during recovery leaves
+// another wakeup pending. Failures retain the last snapshot and retry promptly.
 func (h *Handler) Run(ctx context.Context) error {
-	if h.current.Load() == nil {
-		if err := h.Refresh(ctx); err != nil {
-			return err
-		}
-	}
+	return h.run(ctx, time.Second)
+}
+
+func (h *Handler) run(ctx context.Context, retryInitial time.Duration) error {
+	changes, unsubscribe := h.catalog.WatchPublications()
+	defer unsubscribe()
 	ticker := time.NewTicker(h.config.RefreshInterval)
 	defer ticker.Stop()
+	var retry *time.Timer
+	var retryC <-chan time.Time
+	delay := retryInitial
+	retries := 0
+	stopRetry := func() {
+		if retry != nil {
+			retry.Stop()
+			retry = nil
+		}
+		retryC = nil
+	}
+	defer stopRetry()
+	resetRetry := func() {
+		stopRetry()
+		delay, retries = retryInitial, 0
+	}
+	refresh := func() error {
+		err := h.Refresh(ctx)
+		if err == nil {
+			resetRetry()
+			return nil
+		}
+		if ctx.Err() == nil {
+			slog.ErrorContext(ctx, "refresh serving metadata", slog.Any("err", err))
+			// A bad manifest cannot recover by polling faster forever. Try three
+			// short retries, then wait for another publication or reconciliation.
+			if retry == nil && retries < 3 {
+				retry = time.NewTimer(delay)
+				retryC = retry.C
+				delay *= 2
+				retries++
+			}
+		}
+		return err
+	}
+	if err := refresh(); err != nil && h.current.Load() == nil {
+		return err
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-changes:
+			resetRetry()
+			refresh()
 		case <-ticker.C:
-			if err := h.Refresh(ctx); err != nil && ctx.Err() == nil {
-				slog.ErrorContext(ctx, "refresh serving metadata", slog.Any("err", err))
-			}
+			resetRetry()
+			refresh()
+		case <-retryC:
+			retry, retryC = nil, nil
+			refresh()
 		}
 	}
 }
