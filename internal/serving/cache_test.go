@@ -191,6 +191,7 @@ func handlerWithCache(t *testing.T, c *deploy.Catalog, config metacache.Config) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(h.Close)
 	if err := h.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -256,28 +257,38 @@ func TestConcurrentRequestsShareSiteReleaseAndCompiledRoutes(t *testing.T) {
 	}
 }
 
-func TestExpiredSiteRevalidatesWithoutDeletingOrRepeatingGET(t *testing.T) {
+func TestSiteIdleLifetimeSlidesAndDiskPromotionDoesNotContactOrigin(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
 	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, r, nil)
 	clock := newCacheClock()
-	h := handlerWithCache(t, c, metacache.Config{Now: clock.now, TTL: 5 * time.Second})
+	h := handlerWithCache(t, c, metacache.Config{Directory: t.TempDir(), Now: clock.now, TTL: 5 * time.Second})
 	first, err := h.cachedSite(context.Background(), "foo")
 	if err != nil {
 		t.Fatal(err)
 	}
 	store.reset()
-	clock.advance(6 * time.Second)
-	second, err := h.cachedSite(context.Background(), "foo")
-	if err != nil {
-		t.Fatal(err)
+	for range 6 {
+		clock.advance(4 * time.Second)
+		got, err := h.cachedSite(context.Background(), "foo")
+		if err != nil || got != first {
+			t.Fatalf("hot Site expired since insertion instead of last read: %v", err)
+		}
 	}
 	gets, _, heads := store.counts()
-	if first != second || len(gets) != 0 || heads != 1 {
-		t.Fatalf("TTL discarded unchanged decoded metadata: same=%v GET%v HEAD%d", first == second, gets, heads)
+	if len(gets) != 0 || heads != 0 {
+		t.Fatalf("hot cache rechecked origin: GET%v HEAD%d", gets, heads)
 	}
-	// An external process changes Storage without local publication notifications.
+	clock.advance(6 * time.Second)
+	promoted, err := h.cachedSite(context.Background(), "foo")
+	if err != nil || promoted == first {
+		t.Fatalf("idle Site was not rebuilt from disk: %v", err)
+	}
+	gets, _, heads = store.counts()
+	if len(gets) != 0 || heads != 0 {
+		t.Fatalf("disk promotion checked origin: GET%v HEAD%d", gets, heads)
+	}
 	changed, err := c.GetSite(context.Background(), "foo")
 	if err != nil {
 		t.Fatal(err)
@@ -285,27 +296,36 @@ func TestExpiredSiteRevalidatesWithoutDeletingOrRepeatingGET(t *testing.T) {
 	changed.Disabled = true
 	rawSite(t, store.Store, changed)
 	store.reset()
-	if got, err := h.cachedSite(context.Background(), "foo"); err != nil || got.Disabled {
-		t.Fatal("cache ignored its freshness TTL")
-	}
 	clock.advance(6 * time.Second)
 	got, err := h.cachedSite(context.Background(), "foo")
-	if err != nil || !got.Disabled {
-		t.Fatalf("changed ETag not reloaded: %v", err)
+	if err != nil || got.Disabled {
+		t.Fatalf("idle promotion became a source poll: %v", err)
 	}
 	gets, _, heads = store.counts()
-	if gets[deploy.SiteKey("foo")] != 1 || heads != 1 {
-		t.Fatalf("changed metadata calls: GET%v HEAD%d", gets, heads)
+	if len(gets) != 0 || heads != 0 {
+		t.Fatalf("idle cache hit checked changed origin: GET%v HEAD%d", gets, heads)
+	}
+	if err := h.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store.reset()
+	got, err = h.cachedSite(context.Background(), "foo")
+	if err != nil || !got.Disabled {
+		t.Fatalf("background refresh did not replace Site disk data: %v", err)
+	}
+	gets, _, heads = store.counts()
+	if len(gets) != 0 || heads != 0 {
+		t.Fatalf("freshly seeded disk Site rechecked origin: GET%v HEAD%d", gets, heads)
 	}
 }
 
-func TestFreshCacheSurvivesOriginFailureButExpiredSiteDoesNotServeStale(t *testing.T) {
+func TestCachedMetadataAndDiskPromotionContinueWithoutOriginChecks(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
 	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, r, nil)
 	clock := newCacheClock()
-	h := handlerWithCache(t, c, metacache.Config{Now: clock.now, TTL: 5 * time.Second})
+	h := handlerWithCache(t, c, metacache.Config{Directory: t.TempDir(), Now: clock.now, TTL: 5 * time.Second})
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
 		t.Fatal(got)
 	}
@@ -315,16 +335,19 @@ func TestFreshCacheSurvivesOriginFailureButExpiredSiteDoesNotServeStale(t *testi
 	}
 	store.fail(deploy.SiteKey("foo"), true)
 	store.fail(deploy.ServingReleaseKey(rel), true)
-	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
-		t.Fatalf("fresh validated cache consulted failed origin: %d", got)
-	}
 	clock.advance(6 * time.Second)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
+		t.Fatalf("idle disk promotion consulted failed metadata origin: %d", got)
+	}
+	if err := h.Refresh(context.Background()); err == nil {
+		t.Fatal("expected background refresh failure")
+	}
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
-		t.Fatalf("expired Site hid failed revalidation: %d", got)
+		t.Fatalf("invalidated cache hid failed cold source read: %d", got)
 	}
 	store.fail(deploy.SiteKey("foo"), false)
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
-		t.Fatalf("unchanged immutable release was needlessly reloaded: %d", got)
+		t.Fatalf("immutable descriptor unnecessarily reloaded: %d", got)
 	}
 	store.fail(deploy.ServingFileKey(rel, "index.html"), true)
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
@@ -339,7 +362,7 @@ func TestFreshSiteChangesRevokeWithoutNamespaceRefresh(t *testing.T) {
 	token := deploy.AliasToken("branch", "dev")
 	save(t, c, first, map[string]deploy.Alias{token: {Kind: "branch", Name: "dev", Revision: "one", Release: first.ID}})
 	clock := newCacheClock()
-	h := handlerWithCache(t, c, metacache.Config{Now: clock.now, TTL: 5 * time.Second})
+	h := handlerWithCache(t, c, metacache.Config{Directory: t.TempDir(), Now: clock.now, TTL: 5 * time.Second})
 	store.failLists.Store(true)
 	second := publish(t, c, "foo", "two", map[string]string{"index.html": "two"})
 	save(t, c, second, nil)
@@ -359,11 +382,20 @@ func TestFreshSiteChangesRevokeWithoutNamespaceRefresh(t *testing.T) {
 	site.Disabled = true
 	rawSite(t, store.Store, site)
 	clock.advance(6 * time.Second)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
+		t.Fatalf("idle TTL polled external changes: %d", got)
+	}
+	if err := h.Refresh(context.Background()); err == nil {
+		t.Fatal("expected namespace LIST failure")
+	}
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
 		t.Fatalf("disabled site still served: %d", got)
 	}
 	if err := store.Delete(context.Background(), deploy.SiteKey("foo")); err != nil {
 		t.Fatal(err)
+	}
+	if err := h.Refresh(context.Background()); err == nil {
+		t.Fatal("expected namespace LIST failure")
 	}
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
 		t.Fatalf("deleted site still served: %d", got)

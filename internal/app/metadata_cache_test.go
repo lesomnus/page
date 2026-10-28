@@ -12,7 +12,7 @@ func TestMetadataCacheConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.MetadataCache.TTL != 5*time.Second || c.MetadataCache.MemoryBytes != 4<<20 || c.MetadataCache.DiskBytes != 64<<20 || c.MetadataCache.Directory != filepath.Join(os.TempDir(), "page-cache") {
+	if c.MetadataCache.TTL != 5*time.Minute || c.MetadataCache.MemoryBytes != 4<<20 || c.MetadataCache.DiskBytes != 64<<20 || c.MetadataCache.Directory != filepath.Join(os.TempDir(), "page-cache") {
 		t.Fatalf("wrong defaults: %+v", c.MetadataCache)
 	}
 	c, err = Load(configFile(t, "metadata_cache:\n  directory: ''\n  ttl: 2s\n  memory_bytes: 1048576\n  disk_bytes: 8388608\n"))

@@ -3,6 +3,7 @@ package serving
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -82,13 +83,28 @@ func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
 	return &Handler{catalog: catalog, config: config, metadata: metadata, cacheRevision: catalog.PublicationRevision(), now: time.Now}, nil
 }
 
+// Close stops local cache maintenance after the HTTP server has stopped.
+func (h *Handler) Close() { h.metadata.Close() }
+
 // Refresh reconciles hostname ownership without loading release inventories.
 // Explicit refreshes invalidate mutable cached publications even if listing
 // fails. A failed refresh retains the namespace index, never freshens old data.
+var errPublicationChanged = errors.New("serving: publication changed during namespace refresh")
+
 func (h *Handler) Refresh(ctx context.Context) error {
-	h.invalidateMetadata()
 	h.refresh.Lock()
 	defer h.refresh.Unlock()
+	for range 3 {
+		err := h.refreshNamespace(ctx)
+		if !errors.Is(err, errPublicationChanged) {
+			return err
+		}
+	}
+	return errPublicationChanged
+}
+
+func (h *Handler) refreshNamespace(ctx context.Context) error {
+	revision, generation := h.invalidateMetadata()
 	sites, err := h.catalog.ListSites(ctx)
 	if err != nil {
 		return fmt.Errorf("serving: list sites: %w", err)
@@ -125,6 +141,18 @@ func (h *Handler) Refresh(ctx context.Context) error {
 		if err := add(preview.Host, bindings[preview.Site]); err != nil {
 			return err
 		}
+	}
+	// The periodic source read supplies the disk tier. It does not count as
+	// an HTTP access or keep idle decoded values resident in memory.
+	if h.catalog.PublicationRevision() != revision || h.metadata.Generation() != generation {
+		return errPublicationChanged
+	}
+	for _, site := range sites {
+		data, err := json.Marshal(site)
+		if err != nil {
+			return fmt.Errorf("serving: encode site cache: %w", err)
+		}
+		h.metadata.SeedDisk(deploy.SiteKey(site.Name), metacache.Policy{Mutable: true}, data, "", generation)
 	}
 	h.current.Store(next)
 	return nil

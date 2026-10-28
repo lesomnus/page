@@ -16,12 +16,13 @@ type compiledRelease struct {
 	engine  *routes.Engine
 }
 
-func (h *Handler) invalidateMetadata() {
+func (h *Handler) invalidateMetadata() (uint64, uint64) {
 	h.cacheRevisionMu.Lock()
 	defer h.cacheRevisionMu.Unlock()
 	revision := h.catalog.PublicationRevision()
 	h.metadata.InvalidateMutable()
 	h.cacheRevision = revision
+	return revision, h.metadata.Generation()
 }
 
 // SaveSite increments PublicationRevision before returning. Checking it here
@@ -50,10 +51,6 @@ func (h *Handler) cachedSite(ctx context.Context, name string) (*deploy.Site, er
 		},
 		Decode: func(data []byte) (any, error) {
 			return deploy.DecodeSite(data, name)
-		},
-		Revalidate: func(ctx context.Context, etag string) (bool, error) {
-			info, err := h.catalog.Store.Stat(ctx, deploy.SiteKey(name))
-			return err == nil && etag != "" && info.ETag == etag, err
 		},
 	})
 	if err != nil {

@@ -1,6 +1,6 @@
 // Package metacache provides a bounded read-through cache for small serving
-// metadata. Freshness expiry retains a stale value for revalidation; capacity
-// eviction controls residency independently. Values returned by Get are immutable.
+// metadata. Idle expiry evicts memory while retaining the local disk copy. Values returned
+// by Get are immutable; only explicit publication invalidation changes metadata.
 package metacache
 
 import (
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 const (
 	DefaultMemoryBytes = int64(4 << 20)
 	DefaultDiskBytes   = int64(64 << 20)
-	DefaultTTL         = 5 * time.Second
+	DefaultTTL         = 5 * time.Minute
 	loadTimeout        = 30 * time.Second
 )
 
@@ -58,10 +59,6 @@ type Policy struct {
 	Mutable bool
 	Load    func(context.Context) (data []byte, etag string, err error)
 	Decode  func([]byte) (any, error)
-	// Revalidate returns true only when the previous ETag still authorizes the
-	// previous value. Empty ETags always force Load. Disk mutable values are
-	// revalidated on every promotion, including after process restart.
-	Revalidate func(context.Context, string) (bool, error)
 }
 
 type record struct {
@@ -69,7 +66,7 @@ type record struct {
 	etag       string
 	value      any
 	err        error
-	checked    time.Time
+	accessed   time.Time
 	generation uint64
 }
 type item struct {
@@ -84,17 +81,21 @@ type flight struct {
 }
 
 type Cache struct {
-	config     Config
-	mu         sync.Mutex
-	items      map[string]*list.Element
-	lru        list.List
-	used       int64
-	generation uint64
-	flights    map[string]*flight
-	diskMu     sync.Mutex
-	directory  string
-	diskUsed   int64
-	warnOnce   sync.Once
+	config              Config
+	mu                  sync.Mutex
+	items               map[string]*list.Element
+	lru                 list.List
+	used                int64
+	generation          uint64
+	flights             map[string]*flight
+	diskMu              sync.Mutex
+	directory           string
+	diskUsed            int64
+	warnOnce            sync.Once
+	mutableDiskDisabled bool
+	timer               *time.Timer
+	nextExpiry          time.Time
+	closed              bool
 }
 
 type Stats struct {
@@ -124,6 +125,8 @@ func New(cfg Config) (*Cache, error) {
 // larger than the budget can still be read, but is not retained in memory.
 func (c *Cache) Stats() Stats {
 	c.mu.Lock()
+	c.sweepLocked()
+	c.resetTimerLocked()
 	s := Stats{Entries: len(c.items), MemoryBytes: c.used}
 	c.mu.Unlock()
 	c.diskMu.Lock()
@@ -132,12 +135,35 @@ func (c *Cache) Stats() Stats {
 	return s
 }
 
-// InvalidateMutable marks values stale without deleting their contents. The
-// generation also separates new requests from pre-invalidation in-flight reads.
+// InvalidateMutable removes mutable entries from both tiers. Generation changes
+// separate subsequent reads from an old in-flight origin fetch.
 func (c *Cache) InvalidateMutable() {
+	c.diskMu.Lock()
+	defer c.diskMu.Unlock()
 	c.mu.Lock()
 	c.generation++
+	for key, element := range c.items {
+		if strings.HasPrefix(key, "mutable:") {
+			c.removeLocked(element)
+		}
+	}
+	c.resetTimerLocked()
 	c.mu.Unlock()
+	if err := c.purgeMutableDiskLocked(); err != nil {
+		c.mutableDiskDisabled = true
+		c.warn(err)
+	}
+}
+
+func (c *Cache) Generation() uint64 { c.mu.Lock(); defer c.mu.Unlock(); return c.generation }
+
+// SeedDisk writes a validated background publication snapshot to disk without
+// admitting it to memory or renewing any reader's idle timestamp.
+func (c *Cache) SeedDisk(key string, p Policy, data []byte, etag string, generation uint64) {
+	if key == "" {
+		return
+	}
+	c.writeDisk(c.identity(key, p), p.Mutable, &record{data: bytes.Clone(data), etag: etag, generation: generation})
 }
 
 func (c *Cache) identity(key string, p Policy) string {
@@ -146,11 +172,61 @@ func (c *Cache) identity(key string, p Policy) string {
 	}
 	return "immutable:" + key
 }
-func (c *Cache) fresh(r *record, p Policy, generation uint64) bool {
-	if !p.Mutable {
-		return true
+func (c *Cache) removeLocked(element *list.Element) {
+	old := element.Value.(*item)
+	c.used -= old.weight
+	delete(c.items, old.key)
+	c.lru.Remove(element)
+}
+func (c *Cache) sweepLocked() {
+	now := c.config.Now()
+	for element := c.lru.Back(); element != nil; element = c.lru.Back() {
+		if now.Before(element.Value.(*item).record.accessed.Add(c.config.TTL)) {
+			break
+		}
+		c.removeLocked(element)
 	}
-	return r.generation == generation && c.config.Now().Before(r.checked.Add(c.config.TTL))
+}
+func (c *Cache) resetTimerLocked() {
+	if c.closed {
+		return
+	}
+	oldest := c.lru.Back()
+	if oldest == nil {
+		if c.timer != nil {
+			c.timer.Stop()
+		}
+		c.nextExpiry = time.Time{}
+		return
+	}
+	expiry := oldest.Value.(*item).record.accessed.Add(c.config.TTL)
+	if expiry.Equal(c.nextExpiry) {
+		return
+	}
+	c.nextExpiry = expiry
+	delay := max(time.Millisecond, expiry.Sub(c.config.Now()))
+	if c.timer == nil {
+		c.timer = time.AfterFunc(delay, func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.nextExpiry = time.Time{}
+			c.sweepLocked()
+			c.resetTimerLocked()
+		})
+	} else {
+		c.timer.Reset(delay)
+	}
+}
+
+// Sweep performs only local idle eviction. It never polls origin storage.
+func (c *Cache) Sweep() { c.mu.Lock(); defer c.mu.Unlock(); c.sweepLocked(); c.resetTimerLocked() }
+func (c *Cache) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	if c.timer != nil {
+		c.timer.Stop()
+	}
 }
 
 func (c *Cache) Get(ctx context.Context, key string, p Policy) (any, error) {
@@ -163,16 +239,17 @@ func (c *Cache) Get(ctx context.Context, key string, p Policy) (any, error) {
 	identity := c.identity(key, p)
 	c.mu.Lock()
 	generation := c.generation
-	var previous *record
+	c.sweepLocked()
 	if element := c.items[identity]; element != nil {
 		c.lru.MoveToFront(element)
-		previous = element.Value.(*item).record
-		if c.fresh(previous, p, generation) {
-			value, err := previous.value, previous.err
-			c.mu.Unlock()
-			return value, err
-		}
+		r := element.Value.(*item).record
+		r.accessed = c.config.Now()
+		c.resetTimerLocked()
+		value, err := r.value, r.err
+		c.mu.Unlock()
+		return value, err
 	}
+	c.resetTimerLocked()
 	flightKey := identity
 	if p.Mutable {
 		flightKey += "\x00" + strconv.FormatUint(generation, 10)
@@ -185,7 +262,7 @@ func (c *Cache) Get(ctx context.Context, key string, p Policy) (any, error) {
 		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), loadTimeout)
 		go func() {
 			defer cancel()
-			r, err := c.read(loadCtx, identity, p, previous, generation)
+			r, err := c.read(loadCtx, identity, p, generation)
 			if err == nil {
 				f.value, f.err = r.value, r.err
 			} else {
@@ -206,32 +283,16 @@ func (c *Cache) Get(ctx context.Context, key string, p Policy) (any, error) {
 	}
 }
 
-func (c *Cache) read(ctx context.Context, key string, p Policy, previous *record, generation uint64) (*record, error) {
-	if previous == nil {
-		data, etag, ok := c.readDisk(key, p.Mutable)
-		if ok {
-			value, err := p.Decode(data)
-			if err == nil {
-				previous = &record{data: data, etag: etag, value: value, generation: generation}
-			} else {
-				c.removeDisk(key, p.Mutable, generation)
-			}
-		}
-	}
-	if previous != nil && previous.err == nil {
-		unchanged := !p.Mutable
-		if p.Mutable && previous.etag != "" && p.Revalidate != nil {
-			var err error
-			unchanged, err = p.Revalidate(ctx, previous.etag)
-			if err != nil {
-				return c.failure(key, p, generation, err)
-			}
-		}
-		if unchanged {
-			r := &record{data: previous.data, etag: previous.etag, value: previous.value, checked: c.config.Now(), generation: generation}
+func (c *Cache) read(ctx context.Context, key string, p Policy, generation uint64) (*record, error) {
+	data, etag, ok := c.readDisk(key, p.Mutable)
+	if ok {
+		value, err := p.Decode(data)
+		if err == nil {
+			r := &record{data: data, etag: etag, value: value, accessed: c.config.Now(), generation: generation}
 			c.retain(key, p, r)
 			return r, nil
 		}
+		c.removeDisk(key, p.Mutable, generation)
 	}
 	data, etag, err := p.Load(ctx)
 	if err != nil {
@@ -242,7 +303,7 @@ func (c *Cache) read(ctx context.Context, key string, p Policy, previous *record
 	if err != nil {
 		return nil, err
 	}
-	r := &record{data: data, etag: etag, value: value, checked: c.config.Now(), generation: generation}
+	r := &record{data: data, etag: etag, value: value, accessed: c.config.Now(), generation: generation}
 	c.retain(key, p, r)
 	c.writeDisk(key, p.Mutable, r)
 	return r, nil
@@ -256,7 +317,7 @@ func (c *Cache) failure(key string, p Policy, generation uint64, err error) (*re
 	if !p.Mutable {
 		return nil, err
 	}
-	r := &record{err: err, checked: c.config.Now(), generation: generation}
+	r := &record{err: err, accessed: c.config.Now(), generation: generation}
 	c.retain(key, p, r)
 	return r, nil
 }
@@ -279,6 +340,7 @@ func (c *Cache) retain(key string, p Policy, r *record) {
 	if weight > c.config.MemoryBytes {
 		return
 	}
+	c.sweepLocked()
 	for c.used+weight > c.config.MemoryBytes {
 		element := c.lru.Back()
 		old := element.Value.(*item)
@@ -286,9 +348,11 @@ func (c *Cache) retain(key string, p Policy, r *record) {
 		delete(c.items, old.key)
 		c.lru.Remove(element)
 	}
+	r.accessed = c.config.Now()
 	element := c.lru.PushFront(&item{key: key, record: r, weight: weight})
 	c.items[key] = element
 	c.used += weight
+	c.resetTimerLocked()
 }
 func (c *Cache) warn(err error) {
 	c.warnOnce.Do(func() {
