@@ -5,7 +5,7 @@ preview_style: flat
 preview_alias_mode: qualified # tag-first: readable tag names, then branch fallback
 refresh_interval: 5m
 metadata_cache:
-  ttl: 5s # mutable Site freshness; expiry retains data for revalidation
+  ttl: 5m # idle since last access; evict RAM without checking Storage
   memory_bytes: 4194304 # accounted budget, not a process RSS limit
   disk_bytes: 67108864
   directory: /tmp/page-cache # disposable local disk; empty string disables L2

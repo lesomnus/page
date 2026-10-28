@@ -235,11 +235,12 @@ func Serve(ctx context.Context, c Config, catalog *deploy.Catalog) error {
 	// Local cache keys must never cross an endpoint/bucket/prefix boundary.
 	// S3Config contains no credentials; only its fingerprint is persisted.
 	identity, _ := json.Marshal(c.Storage)
-	c.MetadataCache.Namespace = fmt.Sprintf("page-serving-v1-%x", sha256.Sum256(identity))
+	c.MetadataCache.Namespace = fmt.Sprintf("page-serving-v2-%x", sha256.Sum256(identity))
 	h, e := serving.New(catalog, serving.Config{BaseDomain: c.BaseDomain, PreviewStyle: c.PreviewStyle, PreviewAliasMode: c.PreviewAliasMode, RefreshInterval: c.RefreshInterval, MetadataCache: c.MetadataCache})
 	if e != nil {
 		return e
 	}
+	defer h.Close()
 	if e = h.Refresh(ctx); e != nil {
 		return e
 	}

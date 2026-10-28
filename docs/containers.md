@@ -39,8 +39,8 @@ credentials. Page's durable data lives in S3, so its own container needs no PVC.
 
 `run` refreshes its hostname index after its source commits a publication. The
 five-minute reconciliation discovers missed hostname changes and new sites.
-HTTP readers share a bounded metadata cache: Site data has a five-second
-freshness interval and compact immutable release routing is reused by release
+HTTP readers share a bounded metadata cache: The five-minute TTL measures idle time since
+last access, and compact immutable release routing is reused by release
 identity and Site publication timestamp. Concurrent cold reads coalesce. Source sync and API reads bypass it.
 
 `metadata_cache.memory_bytes` defaults to 4 MiB of accounted cache weight,
@@ -55,12 +55,14 @@ cache for one serving process, needs UID 65532 write access, and is never expose
 as static content. It needs no PVC. Cache files are scoped by the S3
 endpoint/bucket/prefix identity. Disk cache failure falls back to memory/origin.
 
-Freshness expiry keeps the cached value. Site ETag revalidation renews unchanged
-data without a GET, and changed data is replaced. Local publication invalidates
-mutable entries immediately. Memory eviction leaves a disk copy; mutable data
-loaded from disk is revalidated, while immutable release descriptors are reused
-without an S3 read. Disk eviction is capacity-based. Origin revalidation failures
-return 503 rather than serving expired Site data. File inventories, per-file
+TTL controls memory residency only. Hits renew last access, and idle expiry
+removes the memory value without checking Storage. Disk promotion reuses the
+metadata directly. Only a cache miss in both tiers reads the origin. A local
+idle timer performs eviction without network I/O. Site updates come from local
+publication invalidation and the existing five-minute background reconciliation;
+request paths do not revalidate Site ETags. Reconciliation writes fresh Site
+metadata to the disk tier, and publication invalidates old mutable copies.
+Disk eviction is capacity-based. File inventories, per-file
 metadata and bodies stay out of these caches; bodies stream from Storage.
 Source validation and GC can still allocate complete inventories temporarily.
 Optional GitHub webhooks

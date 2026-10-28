@@ -10,42 +10,34 @@ import (
 	"github.com/lesomnus/page/internal/storage"
 )
 
-func TestDiskCacheReloadsCompiledReleaseAndRevalidatesMutableSite(t *testing.T) {
+func TestDiskCacheReloadsCompiledReleaseAndRefreshSeedsMutableSite(t *testing.T) {
 	ctx := context.Background()
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
-	r := publish(t, c, "foo", "one", map[string]string{
-		"index.html": "one",
-		"pages.json": `{"schemaVersion":1,"headers":[{"from":"/*","set":{"X-Disk":"reloaded"}}]}`,
-	})
+	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one", "pages.json": `{"schemaVersion":1,"headers":[{"from":"/*","set":{"X-Disk":"reloaded"}}]}`})
 	save(t, c, r, nil)
 	clock := newCacheClock()
-	config := metacache.Config{Directory: t.TempDir(), Namespace: "one-origin", Now: clock.now}
+	config := metacache.Config{Directory: t.TempDir(), Namespace: "one-origin", Now: clock.now, TTL: 5 * time.Second}
 	first := handlerWithCache(t, c, config)
 	if got := request(first, "GET", "foo.example.com", "/", nil); got.Code != 200 || got.Header().Get("X-Disk") != "reloaded" {
 		t.Fatalf("warm disk cache: %d %q", got.Code, got.Body.String())
 	}
 	if first.metadata.Stats().DiskBytes == 0 {
-		t.Fatal("no metadata persisted to disk")
+		t.Fatal("no disk metadata cached")
 	}
-
-	// A fresh Handler represents a restart with an empty memory tier. Only
-	// the mutable Site needs an origin HEAD; the immutable descriptor and
-	// its compiled routing are recovered from the local disk record.
+	// Startup refresh fetches mutable Site data once and seeds only the disk
+	// tier. Requests recover both records without per-request origin checks.
 	restarted := handlerWithCache(t, c, config)
 	store.reset()
 	store.fail(deploy.ReleasePrefix(r.Owner, r.Site, r.ID)+"serving.json", true)
 	store.fail(manifestKey(r), true)
 	if got := request(restarted, "GET", "foo.example.com", "/", nil); got.Code != 200 || got.Header().Get("X-Disk") != "reloaded" {
-		t.Fatalf("disk cache needed unavailable immutable origin: %d %q", got.Code, got.Body.String())
+		t.Fatalf("disk reuse needed unavailable immutable origin: %d %q", got.Code, got.Body.String())
 	}
 	gets, lists, heads := store.counts()
-	if gets[deploy.SiteKey("foo")] != 0 || len(gets) != 1 || lists != 0 || heads != 2 {
-		t.Fatalf("restart repeated immutable reads: GET%v LIST%d HEAD%d", gets, lists, heads)
+	if len(gets) != 1 || gets[deploy.SiteKey("foo")] != 0 || lists != 0 || heads != 1 {
+		t.Fatalf("disk request rechecked metadata: GET%v LIST%d HEAD%d", gets, lists, heads)
 	}
-
-	// A second restart must not bless stale Site data merely because its disk
-	// file exists and its original memory TTL has not elapsed.
 	again := handlerWithCache(t, c, config)
 	site, err := c.GetSite(ctx, "foo")
 	if err != nil {
@@ -54,12 +46,28 @@ func TestDiskCacheReloadsCompiledReleaseAndRevalidatesMutableSite(t *testing.T) 
 	site.Disabled = true
 	rawSite(t, store.Store, site)
 	store.reset()
-	if got := request(again, "GET", "foo.example.com", "/", nil).Code; got != 404 {
-		t.Fatalf("disk promotion hid changed publication: %d", got)
+	clock.advance(6 * time.Second)
+	if got := request(again, "GET", "foo.example.com", "/", nil).Code; got != 200 {
+		t.Fatalf("cache promotion polled an external publication: %d", got)
 	}
 	gets, _, heads = store.counts()
-	if gets[deploy.SiteKey("foo")] != 1 || heads != 1 {
-		t.Fatalf("mutable disk record was not revalidated/reloaded: GET%v HEAD%d", gets, heads)
+	if gets[deploy.SiteKey("foo")] != 0 || heads != 1 {
+		t.Fatalf("disk promotion revalidated metadata: GET%v HEAD%d", gets, heads)
+	}
+	if err := again.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.reset()
+	if got := request(again, "GET", "foo.example.com", "/", nil).Code; got != 404 {
+		t.Fatalf("background refresh did not discover disabled Site: %d", got)
+	}
+	current, err := again.cachedSite(ctx, "foo")
+	if err != nil || !current.Disabled {
+		t.Fatalf("refresh did not replace mutable disk value: %v", err)
+	}
+	gets, _, heads = store.counts()
+	if len(gets) != 0 || heads != 0 {
+		t.Fatalf("fresh seeded metadata caused origin checks: GET%v HEAD%d", gets, heads)
 	}
 }
 

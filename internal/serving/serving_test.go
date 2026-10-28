@@ -43,6 +43,7 @@ func handler(t *testing.T, c *deploy.Catalog, style string) *Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(h.Close)
 	if err := h.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}

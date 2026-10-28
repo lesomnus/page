@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	diskVersion        = 1
+	diskVersion        = 2
 	maxDataBytes       = 16 << 20
 	maxDiskRecordBytes = (maxDataBytes*4+2)/3 + (64 << 10)
 )
@@ -31,15 +31,42 @@ type diskRecord struct {
 
 func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 func (c *Cache) diskPath(key string) string {
-	return filepath.Join(c.directory, digest([]byte(key))+".json")
+	prefix := "i-"
+	if strings.HasPrefix(key, "mutable:") {
+		prefix = "m-"
+	}
+	return filepath.Join(c.directory, prefix+digest([]byte(key))+".json")
 }
 func diskWeight(size int64) int64 { return ((size + 4095) / 4096) * 4096 }
-func ownedFile(name string) bool {
+func legacyFile(name string) bool {
 	if len(name) != 64+len(".json") || !strings.HasSuffix(name, ".json") {
 		return false
 	}
 	_, err := hex.DecodeString(strings.TrimSuffix(name, ".json"))
 	return err == nil
+}
+func ownedFile(name string) bool {
+	return (strings.HasPrefix(name, "m-") || strings.HasPrefix(name, "i-")) && legacyFile(strings.TrimPrefix(strings.TrimPrefix(name, "m-"), "i-"))
+}
+
+// Startup drops mutable disk data before Serve rebuilds the publication index.
+// Atomic filename prefixes make invalidation independent of JSON readability.
+func (c *Cache) purgeMutableDiskLocked() error {
+	if c.directory == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(c.directory)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if (strings.HasPrefix(entry.Name(), "m-") && ownedFile(entry.Name())) || legacyFile(entry.Name()) {
+			if err := os.Remove(filepath.Join(c.directory, entry.Name())); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	return c.pruneDisk(0)
 }
 func recordChecksum(r diskRecord) string {
 	r.Checksum = ""
@@ -54,7 +81,7 @@ func (c *Cache) openDisk() error {
 	if err := os.Chmod(c.directory, 0700); err != nil {
 		return err
 	}
-	return c.pruneDisk(0)
+	return c.purgeMutableDiskLocked()
 }
 
 // Disk records are disposable, local to this process and cache namespace. No
@@ -112,6 +139,11 @@ func (c *Cache) pruneDisk(incoming int64) error {
 }
 
 func (c *Cache) readDisk(key string, mutable bool) ([]byte, string, bool) {
+	c.diskMu.Lock()
+	defer c.diskMu.Unlock()
+	if mutable && c.mutableDiskDisabled {
+		return nil, "", false
+	}
 	if c.directory == "" {
 		return nil, "", false
 	}
@@ -131,7 +163,6 @@ func (c *Cache) readDisk(key string, mutable bool) ([]byte, string, bool) {
 	}
 	var r diskRecord
 	if err := json.Unmarshal(data, &r); err != nil || r.Version != diskVersion || r.Namespace != c.config.Namespace || r.Key != key || r.Mutable != mutable || len(r.Data) > maxDataBytes || r.Checksum != recordChecksum(r) {
-		c.diskMu.Lock()
 		if current, err := os.Lstat(path); err == nil && os.SameFile(info, current) {
 			if err := os.Remove(path); err == nil {
 				// An externally corrupted file may have changed its size. Recount
@@ -141,7 +172,6 @@ func (c *Cache) readDisk(key string, mutable bool) ([]byte, string, bool) {
 				}
 			}
 		}
-		c.diskMu.Unlock()
 		return nil, "", false
 	}
 	now := c.config.Now()
@@ -166,6 +196,9 @@ func (c *Cache) writeDisk(key string, mutable bool, r *record) {
 	}
 	c.diskMu.Lock()
 	defer c.diskMu.Unlock()
+	if mutable && c.mutableDiskDisabled {
+		return
+	}
 	path := c.diskPath(key)
 	oldWeight := int64(0)
 	if old, err := os.Lstat(path); err == nil && old.Mode().IsRegular() {

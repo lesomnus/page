@@ -136,7 +136,7 @@ func TestFreshProductionReservationAfterFailedRefresh(t *testing.T) {
 	}
 	save(t, c, prod, aliases)
 	clock := newCacheClock()
-	h, err := New(c, Config{BaseDomain: "example.com", PreviewAliasMode: "tag-first", MetadataCache: metacache.Config{Now: clock.now, TTL: 5 * time.Second}})
+	h, err := New(c, Config{BaseDomain: "example.com", PreviewAliasMode: "tag-first", MetadataCache: metacache.Config{Directory: t.TempDir(), Now: clock.now, TTL: 5 * time.Second}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,11 +169,17 @@ func TestFreshProductionReservationAfterFailedRefresh(t *testing.T) {
 	store.mu.Lock()
 	selectedHeads := store.stats[deploy.SiteKey("bar--foo")]
 	store.mu.Unlock()
-	if lists != 0 || gets[deploy.SiteKey("bar--foo")]+selectedHeads != 1 || gets[deploy.SiteKey("foo")] != 1 || gets[deploy.SiteKey("app--bar--foo")] != 1 || len(gets) != 2 {
+	if lists != 0 || gets[deploy.SiteKey("bar--foo")] != 1 || selectedHeads != 0 || gets[deploy.SiteKey("foo")] != 1 || gets[deploy.SiteKey("app--bar--foo")] != 1 || len(gets) != 3 {
 		t.Fatalf("preview read unrelated sites or missed candidate: LIST=%d GET=%v selectedHEAD=%d", lists, gets, selectedHeads)
 	}
 	store.fail(deploy.SiteKey(reserved.Site), true)
 	clock.advance(6 * time.Second)
+	if got := request(h, "GET", host, "/", nil).Code; got != 404 {
+		t.Fatalf("idle disk cache polled candidate origin: %d", got)
+	}
+	if err := h.Refresh(context.Background()); err == nil {
+		t.Fatal("expected namespace LIST failure")
+	}
 	if got := request(h, "GET", host, "/", nil).Code; got != 503 {
 		t.Fatalf("candidate metadata failure became stale winner: %d", got)
 	}
@@ -194,6 +200,9 @@ func TestFreshProductionReservationAfterFailedRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.advance(6 * time.Second)
+	if err := h.Refresh(context.Background()); err == nil {
+		t.Fatal("expected namespace LIST failure")
+	}
 	if got := request(h, "GET", host, "/", nil); got.Code != 200 || got.Body.String() != "branch" {
 		t.Fatalf("missing candidate did not permit branch fallback: %d %q", got.Code, got.Body.String())
 	}

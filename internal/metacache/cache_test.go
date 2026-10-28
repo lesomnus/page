@@ -26,6 +26,7 @@ func testCache(t *testing.T, cfg Config) *Cache {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(c.Close)
 	return c
 }
 func valuePolicy(loads *atomic.Int64, mutable bool) Policy {
@@ -40,48 +41,61 @@ func get(t *testing.T, c *Cache, key string, p Policy) any {
 	return v
 }
 
-func TestMutableFreshnessRetainsAndCoalescesExpiredRevalidation(t *testing.T) {
-	clock := newClock()
-	c := testCache(t, Config{Now: clock.Time, TTL: time.Second})
-	var loads, checks atomic.Int64
-	p := valuePolicy(&loads, true)
-	began, release := make(chan struct{}), make(chan struct{})
-	p.Revalidate = func(context.Context, string) (bool, error) {
-		if checks.Add(1) == 1 {
-			close(began)
-		}
-		<-release
-		return true, nil
-	}
-	if got := get(t, c, "site", p); got != "payload" {
-		t.Fatal(got)
-	}
-	for range 10 {
-		get(t, c, "site", p)
-	}
-	if loads.Load() != 1 || checks.Load() != 0 {
-		t.Fatal("fresh value caused origin work")
-	}
-	clock.Advance(time.Second)
-	if s := c.Stats(); s.Entries != 1 {
-		t.Fatal("TTL purged value", s)
-	}
-	var wg sync.WaitGroup
-	for range 20 {
-		wg.Go(func() {
-			if v, err := c.Get(context.Background(), "site", p); err != nil || v != "payload" {
-				t.Errorf("revalidate: %v %v", v, err)
+func TestIdleTTLSlidesAndDiskReuseNeverCallsOrigin(t *testing.T) {
+	for _, mutable := range []bool{false, true} {
+		t.Run(fmt.Sprint(mutable), func(t *testing.T) {
+			clock := newClock()
+			c := testCache(t, Config{Now: clock.Time, TTL: time.Minute, Directory: t.TempDir()})
+			var loads atomic.Int64
+			p := valuePolicy(&loads, mutable)
+			get(t, c, "key", p)
+			for range 20 {
+				clock.Advance(10 * time.Second)
+				get(t, c, "key", p)
+			}
+			if loads.Load() != 1 || c.Stats().Entries != 1 {
+				t.Fatal("active reads expired metadata", loads.Load(), c.Stats())
+			}
+			clock.Advance(time.Minute)
+			c.Sweep()
+			if s := c.Stats(); s.Entries != 0 || s.DiskBytes == 0 {
+				t.Fatal("idle expiry did not leave only disk", s)
+			}
+			get(t, c, "key", p)
+			if loads.Load() != 1 {
+				t.Fatal("disk promotion revalidated or reloaded origin", loads.Load())
 			}
 		})
 	}
-	<-began
-	close(release)
-	wg.Wait()
-	if loads.Load() != 1 || checks.Load() != 1 {
-		t.Fatalf("coalescing lost: GET=%d HEAD=%d", loads.Load(), checks.Load())
+}
+
+func TestTimerEvictsIdleRAMWithoutAnyReads(t *testing.T) {
+	c := testCache(t, Config{TTL: 20 * time.Millisecond, Directory: t.TempDir()})
+	var loads atomic.Int64
+	p := valuePolicy(&loads, true)
+	get(t, c, "key", p)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		count := len(c.items)
+		c.mu.Unlock()
+		if count == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if s := c.Stats(); s.Entries != 1 {
-		t.Fatal(s)
+	c.mu.Lock()
+	count := len(c.items)
+	c.mu.Unlock()
+	if count != 0 || loads.Load() != 1 {
+		t.Fatalf("idle janitor failed or did origin work: entries%d loads%d", count, loads.Load())
+	}
+	if _, err := os.Stat(c.diskPath(c.identity("key", p))); err != nil {
+		t.Fatal("idle eviction deleted disk", err)
+	}
+	get(t, c, "key", p)
+	if loads.Load() != 1 {
+		t.Fatal("idle disk promotion accessed origin")
 	}
 }
 
@@ -112,82 +126,81 @@ func TestDiskRehydratesEvictedImmutableValuesAndSurvivesRestart(t *testing.T) {
 	}
 }
 
-func TestMutableDiskPromotionRevalidatesEvenInsideTTL(t *testing.T) {
+func TestStartupPurgesMutableDiskButKeepsImmutable(t *testing.T) {
 	cfg := Config{Directory: t.TempDir(), Namespace: "bucket", TTL: time.Hour}
-	var loads, checks atomic.Int64
-	p := valuePolicy(&loads, true)
-	p.Revalidate = func(context.Context, string) (bool, error) { checks.Add(1); return true, nil }
-	get(t, testCache(t, cfg), "site", p)
+	var loads atomic.Int64
+	mutable := valuePolicy(&loads, true)
+	immutable := valuePolicy(&loads, false)
+	first := testCache(t, cfg)
+	get(t, first, "site", mutable)
+	get(t, first, "release", immutable)
 	second := testCache(t, cfg)
-	get(t, second, "site", p)
-	if loads.Load() != 1 || checks.Load() != 1 {
-		t.Fatalf("disk freshness was trusted or GET repeated: GET%d HEAD%d", loads.Load(), checks.Load())
+	get(t, second, "site", mutable)
+	get(t, second, "release", immutable)
+	if loads.Load() != 3 {
+		t.Fatal("startup reused mutable data or discarded immutable", loads.Load())
 	}
 	second.InvalidateMutable()
-	p.Revalidate = func(context.Context, string) (bool, error) { checks.Add(1); return false, nil }
-	get(t, second, "site", p)
-	if loads.Load() != 2 || checks.Load() != 2 {
-		t.Fatalf("changed source was not fetched: GET%d HEAD%d", loads.Load(), checks.Load())
+	get(t, second, "site", mutable)
+	if loads.Load() != 4 {
+		t.Fatal("invalidation resurrected mutable disk", loads.Load())
 	}
 }
 
-func TestErrorsDoNotAuthorizeStaleValueAndKeepForRecovery(t *testing.T) {
+func TestNegativeCacheIdleExpiryAndPublicationInvalidation(t *testing.T) {
 	clock := newClock()
 	c := testCache(t, Config{Now: clock.Time, TTL: time.Second, Directory: t.TempDir()})
 	var loads atomic.Int64
 	p := valuePolicy(&loads, true)
-	fail := true
-	p.Revalidate = func(context.Context, string) (bool, error) {
-		if fail {
-			return false, errors.New("source unavailable")
-		}
-		return true, nil
-	}
-	get(t, c, "site", p)
-	clock.Advance(time.Second)
-	if _, err := c.Get(context.Background(), "site", p); err == nil {
-		t.Fatal("expired value served on failed validation")
-	}
-	if c.Stats().Entries != 1 {
-		t.Fatal("validation failure deleted old data")
-	}
-	fail = false
-	get(t, c, "site", p)
-	if loads.Load() != 1 {
-		t.Fatal("recovery discarded revalidatable value")
-	}
-}
-
-func TestEmptyETagReloadsAndNotFoundIsBrieflyCached(t *testing.T) {
-	clock := newClock()
-	c := testCache(t, Config{Now: clock.Time, TTL: time.Second, Directory: t.TempDir()})
-	var loads, checks atomic.Int64
-	p := Policy{Mutable: true, Load: func(context.Context) ([]byte, string, error) { loads.Add(1); return []byte("value"), "", nil }, Decode: func(b []byte) (any, error) { return string(b), nil }, Revalidate: func(context.Context, string) (bool, error) { checks.Add(1); return true, nil }}
-	get(t, c, "site", p)
-	clock.Advance(time.Second)
-	get(t, c, "site", p)
-	if loads.Load() != 2 || checks.Load() != 0 {
-		t.Fatal("empty validator was reused")
-	}
 	p.Load = func(context.Context) ([]byte, string, error) { loads.Add(1); return nil, "", storage.ErrNotFound }
-	c.InvalidateMutable()
 	for range 2 {
-		if _, err := c.Get(context.Background(), "site", p); !errors.Is(err, storage.ErrNotFound) {
+		if _, err := c.Get(context.Background(), "missing", p); !errors.Is(err, storage.ErrNotFound) {
 			t.Fatal(err)
 		}
 	}
-	if loads.Load() != 3 {
-		t.Fatal("404 not coalesced by freshness")
-	}
-	if _, err := os.Stat(c.diskPath(c.identity("site", p))); !os.IsNotExist(err) {
-		t.Fatal("deleted Site remained on disk", err)
+	if loads.Load() != 1 {
+		t.Fatal("404 not shared")
 	}
 	clock.Advance(time.Second)
-	if _, err := c.Get(context.Background(), "site", p); !errors.Is(err, storage.ErrNotFound) {
+	c.Sweep()
+	if _, err := c.Get(context.Background(), "missing", p); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatal(err)
 	}
-	if loads.Load() != 4 {
-		t.Fatal("404 retained permanently")
+	if loads.Load() != 2 {
+		t.Fatal("idle404 persisted")
+	}
+	c.InvalidateMutable()
+	p = valuePolicy(&loads, true)
+	get(t, c, "missing", p)
+	if loads.Load() != 3 {
+		t.Fatal("404 blocked publication")
+	}
+}
+
+func TestBackgroundSeedIsGenerationGuardedAndDoesNotAdmitOrTouchRAM(t *testing.T) {
+	clock := newClock()
+	c := testCache(t, Config{Directory: t.TempDir(), Now: clock.Time, TTL: time.Minute})
+	var loads atomic.Int64
+	p := valuePolicy(&loads, true)
+	generation := c.Generation()
+	c.SeedDisk("site", p, []byte("seed"), "", generation)
+	if c.Stats().Entries != 0 {
+		t.Fatal("background update admitted RAM")
+	}
+	if got := get(t, c, "site", p); got != "seed" || loads.Load() != 0 {
+		t.Fatal(got, loads.Load())
+	}
+	clock.Advance(50 * time.Second)
+	c.SeedDisk("site", p, []byte("seed"), "", generation)
+	clock.Advance(10 * time.Second)
+	c.Sweep()
+	if c.Stats().Entries != 0 {
+		t.Fatal("background update renewed idle timestamp")
+	}
+	c.InvalidateMutable()
+	c.SeedDisk("site", p, []byte("obsolete"), "", generation)
+	if got := get(t, c, "site", p); got != "payload" || loads.Load() != 1 {
+		t.Fatal("old background update survived invalidation", got, loads.Load())
 	}
 }
 
@@ -204,7 +217,7 @@ func TestInvalidationSeparatesFlightsAndGuardsMemoryAndDisk(t *testing.T) {
 			return []byte("old"), "old", nil
 		}
 		return []byte("new"), "new", nil
-	}, Decode: func(b []byte) (any, error) { return string(b), nil }, Revalidate: func(context.Context, string) (bool, error) { return true, nil }}
+	}, Decode: func(b []byte) (any, error) { return string(b), nil }}
 	old := make(chan any, 1)
 	go func() {
 		v, err := c.Get(context.Background(), "site", p)
@@ -226,9 +239,9 @@ func TestInvalidationSeparatesFlightsAndGuardsMemoryAndDisk(t *testing.T) {
 	if got := get(t, c, "site", p); got != "new" {
 		t.Fatal("old flight replaced memory", got)
 	}
-	restarted := testCache(t, cfg)
-	if got := get(t, restarted, "site", p); got != "new" || loads.Load() != 2 {
-		t.Fatalf("old flight replaced disk: %v %d", got, loads.Load())
+	data, _, ok := c.readDisk(c.identity("site", p), true)
+	if !ok || string(data) != "new" || loads.Load() != 2 {
+		t.Fatalf("old flight replaced disk: %q %v loads%d", data, ok, loads.Load())
 	}
 }
 
@@ -371,7 +384,7 @@ func TestInvalidConfigurationAndInvalidDecodedData(t *testing.T) {
 		}
 	}
 	cfg, err := (Config{}).Normalize()
-	if err != nil || cfg.TTL != 5*time.Second || cfg.MemoryBytes != 4<<20 || cfg.DiskBytes != 64<<20 {
+	if err != nil || cfg.TTL != 5*time.Minute || cfg.MemoryBytes != 4<<20 || cfg.DiskBytes != 64<<20 {
 		t.Fatal(cfg, err)
 	}
 	c := testCache(t, Config{Directory: t.TempDir()})
@@ -385,5 +398,34 @@ func TestInvalidConfigurationAndInvalidDecodedData(t *testing.T) {
 	}
 	if s := c.Stats(); s.Entries != 0 || s.DiskBytes != 0 || loads.Load() != 2 {
 		t.Fatal(s, loads.Load())
+	}
+}
+
+func TestConcurrentColdReadsShareOneOriginLoad(t *testing.T) {
+	c := testCache(t, Config{})
+	var loads atomic.Int64
+	p := valuePolicy(&loads, false)
+	started, release := make(chan struct{}), make(chan struct{})
+	p.Load = func(context.Context) ([]byte, string, error) {
+		if loads.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return []byte("value"), "", nil
+	}
+	var wg sync.WaitGroup
+	for range 30 {
+		wg.Go(func() {
+			v, err := c.Get(context.Background(), "key", p)
+			if err != nil || v != "value" {
+				t.Errorf("burst: %v %v", v, err)
+			}
+		})
+	}
+	<-started
+	close(release)
+	wg.Wait()
+	if loads.Load() != 1 {
+		t.Fatal("burst duplicated origin reads", loads.Load())
 	}
 }
