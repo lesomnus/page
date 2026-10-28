@@ -124,6 +124,9 @@ func (s *Sync) publish(ctx context.Context, repo repository, site, sha string) (
 	origin := deploy.Origin{Kind: "git", RepositoryID: strconv.FormatInt(repo.ID, 10), Repository: repo.FullName, Revision: sha, Directory: m.Publish.Directory}
 	id := deploy.ReleaseID(s.cfg.ID, site, origin)
 	if r, err := s.cat.GetRelease(ctx, s.cfg.ID, site, id); err == nil {
+		if err := s.cat.EnsureServingProjection(ctx, r); err != nil {
+			return nil, err
+		}
 		return r, nil
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return nil, err

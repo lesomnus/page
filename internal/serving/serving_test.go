@@ -94,8 +94,8 @@ func TestHostAndSnapshotRouting(t *testing.T) {
 	}
 	second := publish(t, c, "foo", "second", map[string]string{"index.html": "foo-v2"})
 	save(t, c, second, nil)
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "foo-v1" {
-		t.Fatalf("snapshot moved without refresh: %q", got)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "foo-v2" {
+		t.Fatalf("fresh release not visible: %q", got)
 	}
 	if err := h.Refresh(context.Background()); err != nil {
 		t.Fatal(err)

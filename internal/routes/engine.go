@@ -62,6 +62,20 @@ type Engine struct {
 // Compile validates a config against one immutable release's file inventory.
 // A nil config has the default static-file behavior.
 func Compile(config *Config, files map[string]bool) (*Engine, error) {
+	return compile(config, files, true)
+}
+
+// CompileRuntime validates routing syntax without loading a release inventory.
+// File existence is checked by ResolveLookup while handling each request.
+// The publisher still uses Compile for inventory-dependent validation, including
+// redirect cycles, implicit canonical redirects and forbidden immutable file types.
+// Runtime resolution returns one redirect without following it; repeating global
+// cycle analysis per request would add quadratic work to published configurations.
+func CompileRuntime(config *Config) (*Engine, error) {
+	return compile(config, nil, false)
+}
+
+func compile(config *Config, files map[string]bool, inventory bool) (*Engine, error) {
 	c := Config{SchemaVersion: 1}
 	if config != nil {
 		b, err := json.Marshal(config)
@@ -94,7 +108,10 @@ func Compile(config *Config, files map[string]bool) (*Engine, error) {
 	if total > MaxRules {
 		return nil, invalid("too many rules")
 	}
-	e := &Engine{config: c, files: make(map[string]bool, len(files))}
+	e := &Engine{config: c}
+	if inventory {
+		e.files = make(map[string]bool, len(files))
+	}
 	for p, present := range files {
 		if !safeRelative(p) {
 			return nil, invalid("unsafe release file %q", p)
@@ -131,7 +148,7 @@ func Compile(config *Config, files map[string]bool) (*Engine, error) {
 		if err = validateTemplate(target, p.names); err != nil {
 			return nil, err
 		}
-		if r.Rewrite != "" && !e.hasTarget(target) {
+		if inventory && r.Rewrite != "" && !e.hasTarget(target) {
 			return nil, invalid("rewrite target %q does not match a release file", target)
 		}
 		e.rules = append(e.rules, compiledRule{p, r})
@@ -140,7 +157,7 @@ func Compile(config *Config, files map[string]bool) (*Engine, error) {
 		if err := validateTemplate(f.Rewrite, nil); err != nil {
 			return nil, err
 		}
-		if !e.files[strings.TrimPrefix(f.Rewrite, "/")] {
+		if inventory && !e.files[strings.TrimPrefix(f.Rewrite, "/")] {
 			return nil, invalid("fallback target %q is missing", f.Rewrite)
 		}
 		for _, raw := range f.Exclude {
@@ -158,7 +175,7 @@ func Compile(config *Config, files map[string]bool) (*Engine, error) {
 		if err := validateTemplate(target, nil); err != nil {
 			return nil, err
 		}
-		if !e.files[strings.TrimPrefix(target, "/")] {
+		if inventory && !e.files[strings.TrimPrefix(target, "/")] {
 			return nil, invalid("error page %q is missing", target)
 		}
 	}
@@ -189,7 +206,7 @@ func Compile(config *Config, files map[string]bool) (*Engine, error) {
 			return nil, err
 		}
 		for filename := range e.files {
-			if _, ok := p.match("/" + filename); ok {
+			if matchesPath(p, "/"+filename) {
 				ext := strings.ToLower(path.Ext(filename))
 				if ext == ".html" || ext == ".htm" || ext == ".xhtml" || strings.EqualFold(path.Base(filename), "pages.json") {
 					return nil, invalid("immutable assets may not include HTML or pages.json: %s", filename)
@@ -198,8 +215,10 @@ func Compile(config *Config, files map[string]bool) (*Engine, error) {
 		}
 		e.immutable = append(e.immutable, p)
 	}
-	if err := e.checkRedirects(); err != nil {
-		return nil, err
+	if inventory {
+		if err := e.checkRedirects(); err != nil {
+			return nil, err
+		}
 	}
 	return e, nil
 }
@@ -235,74 +254,128 @@ func safeAbsolute(p string) bool {
 // Resolve matches rules and headers against an already URL-decoded path.
 // Rewrites are one lookup, never another pass through the route list.
 func (e *Engine) Resolve(requestPath string, navigation bool) Decision {
+	d, _ := e.ResolveLookup(requestPath, navigation, func(p string) (bool, error) { return e.files[p], nil })
+	return d
+}
+
+// ResolveLookup reads only the candidate file paths needed for this request.
+// Lookup failures propagate rather than looking like absent files.
+func (e *Engine) ResolveLookup(requestPath string, navigation bool, exists func(string) (bool, error)) (Decision, error) {
 	headers := map[string]string{}
 	if !safeAbsolute(requestPath) {
-		return Decision{Status: 400, Headers: headers, Action: ActionNotFound}
+		return Decision{Status: 400, Headers: headers, Action: ActionNotFound}, nil
+	}
+	lookup := func(p string) (bool, error) {
+		if !safeRelative(p) {
+			return false, nil
+		}
+		if exists == nil {
+			return false, errors.New("routes: no file lookup")
+		}
+		return exists(p)
+	}
+	notFound := func(action string) (Decision, error) {
+		d := e.notFound(headers, action)
+		if d.Path != "" {
+			present, err := lookup(d.Path)
+			if err != nil {
+				return Decision{}, err
+			}
+			if !present {
+				d.Path = ""
+			}
+		}
+		return d, nil
 	}
 	for _, h := range e.headers {
-		if _, ok := h.pattern.match(requestPath); ok {
+		if matchesPath(h.pattern, requestPath) {
 			for k, v := range h.values {
 				headers[k] = v
 			}
 		}
 	}
 	for _, r := range e.rules {
-		captures, ok := r.pattern.match(requestPath)
-		if !ok {
+		if !matchesPath(r.pattern, requestPath) {
 			continue
 		}
+		captures, _ := r.pattern.match(requestPath)
 		target := expand(r.rule.Rewrite, captures)
 		if r.rule.Redirect != "" {
 			target = expand(r.rule.Redirect, captures)
 			if !safeAbsolute(target) {
-				return e.notFound(headers, ActionRewrite)
+				return notFound(ActionRewrite)
 			}
-			return Decision{Status: r.rule.Status, Redirect: target, Headers: headers, Action: ActionRedirect}
+			return Decision{Status: r.rule.Status, Redirect: target, Headers: headers, Action: ActionRedirect}, nil
 		}
 		if !safeAbsolute(target) {
-			return e.notFound(headers, ActionRewrite)
+			return notFound(ActionRewrite)
 		}
 		file := strings.TrimPrefix(target, "/")
-		if !e.files[file] {
-			return e.notFound(headers, ActionRewrite)
+		present, err := lookup(file)
+		if err != nil {
+			return Decision{}, err
 		}
-		return Decision{Path: file, Status: 200, Headers: headers, Action: ActionRewrite}
+		if !present {
+			return notFound(ActionRewrite)
+		}
+		return Decision{Path: file, Status: 200, Headers: headers, Action: ActionRewrite}, nil
 	}
 	file := strings.TrimPrefix(requestPath, "/")
-	if e.files[file] {
-		return Decision{Path: file, Status: 200, Headers: headers, Action: ActionFile}
+	present, err := lookup(file)
+	if err != nil {
+		return Decision{}, err
+	}
+	if present {
+		return Decision{Path: file, Status: 200, Headers: headers, Action: ActionFile}, nil
 	}
 	trimmed := strings.TrimSuffix(file, "/")
-	if e.config.Routing.CleanURLs && trimmed != "" && path.Ext(trimmed) == "" && e.files[trimmed+".html"] {
-		if redirect := e.canonical(requestPath, false); redirect != "" {
-			return Decision{Status: 301, Redirect: redirect, Headers: headers, Action: ActionRedirect}
+	if e.config.Routing.CleanURLs && trimmed != "" && path.Ext(trimmed) == "" {
+		present, err := lookup(trimmed + ".html")
+		if err != nil {
+			return Decision{}, err
 		}
-		return Decision{Path: trimmed + ".html", Status: 200, Headers: headers, Action: ActionFile}
+		if present {
+			if redirect := e.canonical(requestPath, false); redirect != "" {
+				return Decision{Status: 301, Redirect: redirect, Headers: headers, Action: ActionRedirect}, nil
+			}
+			return Decision{Path: trimmed + ".html", Status: 200, Headers: headers, Action: ActionFile}, nil
+		}
 	}
 	index := trimmed
 	if index != "" {
 		index += "/"
 	}
 	index += e.config.Routing.Index
-	if e.files[index] {
+	present, err = lookup(index)
+	if err != nil {
+		return Decision{}, err
+	}
+	if present {
 		if redirect := e.canonical(requestPath, true); redirect != "" {
-			return Decision{Status: 301, Redirect: redirect, Headers: headers, Action: ActionRedirect}
+			return Decision{Status: 301, Redirect: redirect, Headers: headers, Action: ActionRedirect}, nil
 		}
-		return Decision{Path: index, Status: 200, Headers: headers, Action: ActionFile}
+		return Decision{Path: index, Status: 200, Headers: headers, Action: ActionFile}, nil
 	}
 	if f := e.config.Routing.Fallback; navigation && f != nil {
 		excluded := false
 		for _, p := range e.excludes {
-			if _, ok := p.match(requestPath); ok {
+			if matchesPath(p, requestPath) {
 				excluded = true
 				break
 			}
 		}
 		if !excluded {
-			return Decision{Path: strings.TrimPrefix(f.Rewrite, "/"), Status: 200, Headers: headers, Action: ActionFallback}
+			file := strings.TrimPrefix(f.Rewrite, "/")
+			present, err := lookup(file)
+			if err != nil {
+				return Decision{}, err
+			}
+			if present {
+				return Decision{Path: file, Status: 200, Headers: headers, Action: ActionFallback}, nil
+			}
 		}
 	}
-	return e.notFound(headers, ActionNotFound)
+	return notFound(ActionNotFound)
 }
 
 func (e *Engine) canonical(p string, directory bool) string {
@@ -339,11 +412,63 @@ func (e *Engine) Immutable(filename string) bool {
 		return false
 	}
 	for _, pattern := range e.immutable {
-		if _, ok := pattern.match(p); ok {
+		if matchesPath(pattern, p) {
 			return true
 		}
 	}
 	return false
+}
+
+// MatchImmutable checks a previously published asset policy without compiling
+// its unrelated routing rules. File type restrictions remain the publisher's
+// and serving file envelope's responsibility.
+func MatchImmutable(config *Config, filename string) (bool, error) {
+	if config == nil {
+		return false, nil
+	}
+	if len(config.Assets.Immutable) > MaxRules {
+		return false, invalid("too many rules")
+	}
+	if !strings.HasPrefix(filename, "/") {
+		filename = "/" + filename
+	}
+	if !safeAbsolute(filename) {
+		return false, nil
+	}
+	matched := false
+	for _, raw := range config.Assets.Immutable {
+		p, err := newPattern(raw)
+		if err != nil {
+			return false, err
+		}
+		matched = matchesPath(p, filename) || matched
+	}
+	return matched, nil
+}
+
+// Matching headers and excludes needs no captures or path segment slices.
+// Route captures are allocated only after a pattern has actually matched.
+func matchesPath(p pattern, requestPath string) bool {
+	rest := strings.TrimPrefix(requestPath, "/")
+	remaining := requestPath != "/"
+	for _, s := range p.segments {
+		if s.wild {
+			return true
+		}
+		if !remaining {
+			return false
+		}
+		part, next, more := strings.Cut(rest, "/")
+		if s.name != "" {
+			if part == "" {
+				return false
+			}
+		} else if s.literal != part {
+			return false
+		}
+		rest, remaining = next, more
+	}
+	return !remaining
 }
 
 func (e *Engine) hasTarget(target string) bool {

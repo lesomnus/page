@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,33 +30,19 @@ type Config struct {
 	RefreshInterval  time.Duration `yaml:"refresh_interval"`
 }
 
-type retainedAsset struct {
-	release *deploy.Release
-	engine  *routes.Engine
-	expires time.Time
+// hostBinding keeps only namespace ownership. Release selection, routing and
+// file metadata are read from Storage for each request.
+type hostBinding struct {
+	site, owner, repository string
 }
-type route struct {
-	release *deploy.Release
-	engine  *routes.Engine
-	assets  []retainedAsset
-}
-type snapshot struct{ routes map[string]route }
-
-type cachedSite struct {
-	site *deploy.Site
-	etag string
-}
-
-type releaseKey struct{ owner, site, id string }
+type snapshot struct{ routes map[string]hostBinding }
 
 type Handler struct {
-	catalog  *deploy.Catalog
-	config   Config
-	refresh  sync.Mutex
-	current  atomic.Pointer[snapshot]
-	sites    map[string]cachedSite
-	releases map[releaseKey]route
-	now      func() time.Time
+	catalog *deploy.Catalog
+	config  Config
+	refresh sync.Mutex
+	current atomic.Pointer[snapshot]
+	now     func() time.Time
 }
 
 func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
@@ -88,132 +73,49 @@ func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
 	return &Handler{catalog: catalog, config: config, now: time.Now}, nil
 }
 
-// Refresh replaces the complete routing snapshot only after every referenced
-// release has been read successfully. An unavailable store leaves readers alone.
+// Refresh reconciles hostname ownership without retaining site publications,
+// release inventories or compiled routing. A failed refresh keeps the last
+// namespace index; requests still read their publication metadata from Storage.
 func (h *Handler) Refresh(ctx context.Context) error {
 	h.refresh.Lock()
 	defer h.refresh.Unlock()
-	objects, err := h.catalog.ListSiteObjects(ctx)
+	sites, err := h.catalog.ListSites(ctx)
 	if err != nil {
 		return fmt.Errorf("serving: list sites: %w", err)
-	}
-	nextSites := make(map[string]cachedSite, len(objects))
-	sites := make([]*deploy.Site, 0, len(objects))
-	for _, info := range objects {
-		cached, ok := h.sites[info.Key]
-		if !ok || info.ETag == "" || cached.etag == "" || info.ETag != cached.etag {
-			name := strings.TrimSuffix(strings.TrimPrefix(info.Key, "sites/"), "/site.json")
-			site, fetched, e := h.catalog.GetSiteInfo(ctx, name)
-			if e != nil {
-				return fmt.Errorf("serving: load site %s: %w", name, e)
-			}
-			cached = cachedSite{site: site, etag: fetched.ETag}
-		}
-		nextSites[info.Key] = cached
-		sites = append(sites, cached.site)
 	}
 	previews, err := deploy.PlanPreviews(sites, h.config.BaseDomain, h.config.PreviewStyle, h.config.PreviewAliasMode)
 	if err != nil {
 		return fmt.Errorf("serving: plan previews: %w", err)
 	}
-	bySite := map[string][]deploy.PreviewRoute{}
-	for _, preview := range previews.Routes {
-		bySite[preview.Site] = append(bySite[preview.Site], preview)
+	next := &snapshot{routes: make(map[string]hostBinding)}
+	bindings := make(map[string]hostBinding, len(sites))
+	add := func(host string, binding hostBinding) error {
+		if !validHostname(host) {
+			return errors.New("serving: invalid generated hostname")
+		}
+		if _, exists := next.routes[host]; exists {
+			return errors.New("serving: duplicate hostname")
+		}
+		next.routes[host] = binding
+		return nil
 	}
-	next := &snapshot{routes: make(map[string]route)}
-	nextReleases := make(map[releaseKey]route)
-	now := h.now()
 	for _, site := range sites {
-		if !deploy.ValidName(site.Name) {
-			return errors.New("serving: invalid site name")
-		}
-		if site.Disabled {
-			continue
-		}
-		load := func(id string) (route, error) {
-			key := releaseKey{site.Owner, site.Name, id}
-			if cached, ok := nextReleases[key]; ok {
-				return cached, nil
-			}
-			result, ok := h.releases[key]
-			if !ok {
-				rel, e := h.catalog.GetRelease(ctx, site.Owner, site.Name, id)
-				if e != nil {
-					return route{}, fmt.Errorf("serving: load release %s: %w", id, e)
-				}
-				files := make(map[string]bool, len(rel.Files))
-				for path := range rel.Files {
-					files[path] = true
-				}
-				engine, e := routes.Compile(rel.Pages, files)
-				if e != nil {
-					return route{}, fmt.Errorf("serving: compile release %s: %w", id, e)
-				}
-				result = route{release: rel, engine: engine}
-			}
-			rel := result.release
-			if !rel.Complete || rel.ID != id || rel.Site != site.Name || rel.Owner != site.Owner || rel.Origin.RepositoryID != site.RepositoryID {
-				return route{}, errors.New("serving: invalid release ownership or completion")
-			}
-			nextReleases[key] = result
-			return result, nil
-		}
-		retained := []retainedAsset{}
-		if site.Production != "" {
-			for id, expiry := range site.AssetReleases {
-				if !now.Before(expiry) || id == site.Production {
-					continue
-				}
-				old, e := load(id)
-				if e != nil {
-					return e
-				}
-				retained = append(retained, retainedAsset{release: old.release, engine: old.engine, expires: expiry})
-			}
-			sort.Slice(retained, func(i, j int) bool {
-				left, right := retained[i].release, retained[j].release
-				if !left.CreatedAt.Equal(right.CreatedAt) {
-					return left.CreatedAt.After(right.CreatedAt)
-				}
-				return left.ID < right.ID
-			})
-		}
-		add := func(host, id, revision string, production bool) error {
-			if id == "" {
-				return nil
-			}
-			result, e := load(id)
-			if e != nil {
-				return e
-			}
-			if revision != "" && revision != result.release.Origin.Revision {
-				return errors.New("serving: preview revision does not match release")
-			}
-			if production {
-				result.assets = retained
-			}
-			if !validHostname(host) {
-				return errors.New("serving: invalid generated hostname")
-			}
-			if _, exists := next.routes[host]; exists {
-				return errors.New("serving: duplicate hostname")
-			}
-			next.routes[host] = result
-			return nil
-		}
-		if err := add(deploy.Host(h.config.BaseDomain, h.config.PreviewStyle, site.Name, ""), site.Production, "", true); err != nil {
-			return err
-		}
-		for _, preview := range bySite[site.Name] {
-			if err := add(preview.Host, preview.Alias.Release, preview.Alias.Revision, false); err != nil {
+		binding := hostBinding{site.Name, site.Owner, site.RepositoryID}
+		bindings[site.Name] = binding
+		if !site.Disabled && site.Production != "" {
+			if err := add(deploy.Host(h.config.BaseDomain, h.config.PreviewStyle, site.Name, ""), binding); err != nil {
 				return err
 			}
 		}
 	}
-	// Publish caches only with a complete routing snapshot. Partial inventory or
-	// release failures must not acknowledge a fingerprint or prune old entries.
-	h.sites = nextSites
-	h.releases = nextReleases
+	for _, preview := range previews.Routes {
+		if preview.Alias.Release == "" {
+			continue
+		}
+		if err := add(preview.Host, bindings[preview.Site]); err != nil {
+			return err
+		}
+	}
 	h.current.Store(next)
 	return nil
 }
@@ -301,7 +203,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "publication metadata unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	route, ok := s.routes[host]
+	binding, ok := s.routes[host]
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -311,16 +213,90 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	decision := route.engine.Resolve("/"+p, isNavigation(r, p))
+	site, err := h.catalog.GetSite(r.Context(), binding.site)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+		} else {
+			http.Error(w, "publication metadata unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+	if site.Disabled || site.Owner != binding.owner || site.RepositoryID != binding.repository {
+		http.NotFound(w, r)
+		return
+	}
+	id, revision := site.Production, ""
+	production := host == deploy.Host(h.config.BaseDomain, h.config.PreviewStyle, site.Name, "")
+	if !production {
+		id = ""
+		candidates, err := h.previewSites(r.Context(), host, site)
+		if err != nil {
+			http.Error(w, "publication metadata unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		previews, err := deploy.PlanPreviews(candidates, h.config.BaseDomain, h.config.PreviewStyle, h.config.PreviewAliasMode)
+		if err != nil {
+			http.Error(w, "publication metadata unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		for _, preview := range previews.Routes {
+			if preview.Host == host && preview.Site == binding.site {
+				id, revision = preview.Alias.Release, preview.Alias.Revision
+				break
+			}
+		}
+	}
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	rel, err := h.servingRelease(r.Context(), site, id)
+	if err != nil || (revision != "" && revision != rel.Origin.Revision) {
+		http.Error(w, "release metadata unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	engine, err := routes.CompileRuntime(rel.Pages)
+	if err != nil {
+		http.Error(w, "routing metadata unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	// Only the handful of candidate paths considered by this request live here.
+	files := map[string]*deploy.ServingFile{}
+	lookup := func(p string) (bool, error) {
+		if file, ok := files[p]; ok {
+			return file != nil, nil
+		}
+		file, err := h.catalog.GetServingFile(r.Context(), rel, p)
+		if errors.Is(err, storage.ErrNotFound) {
+			files[p] = nil
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		files[p] = file
+		return true, nil
+	}
+	decision, err := engine.ResolveLookup("/"+p, isNavigation(r, p), lookup)
+	if err != nil {
+		http.Error(w, "file metadata unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if decision.Status == http.StatusBadRequest {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	rel := route.release
-	if (decision.Action == routes.ActionNotFound || decision.Action == routes.ActionFallback) && p != "" {
-		if old, file, ok := h.previousAsset(route, p); ok {
-			rel = old
-			decision.Path = file.Path
+	selected := files[decision.Path]
+	if production && (decision.Action == routes.ActionNotFound || decision.Action == routes.ActionFallback) && p != "" {
+		old, file, err := h.previousAsset(r.Context(), site, p)
+		if err != nil {
+			http.Error(w, "asset metadata unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if file != nil {
+			rel, selected = old, file
+			decision.Path = file.File.Path
 			decision.Status = http.StatusOK
 			decision.Action = routes.ActionFile
 		}
@@ -339,12 +315,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target.String(), decision.Status)
 		return
 	}
-	file, exists := rel.Files[decision.Path]
-	if !exists || decision.Path == "" {
+	if selected == nil || decision.Path == "" {
 		h.notFound(w, r, decision.Headers)
 		return
 	}
-	key := deploy.FileKey(rel, decision.Path)
+	file := selected.File
+	key := deploy.ServingObjectKey(rel, decision.Path)
 	info, err := h.catalog.Store.Stat(r.Context(), key)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -389,6 +365,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, path.Base(decision.Path), rel.CreatedAt, reader)
 }
 
+// Flat hostnames can be shared by different site/ref splits: app--bar--foo
+// could be token app--bar on foo, token app on bar--foo, or a production name.
+// Derive those bounded candidates from the DNS label and read their current
+// publication state, including empty/disabled sites that reserve their names.
+// Nested hostnames separate the site into its own label and cannot overlap.
+func (h *Handler) previewSites(ctx context.Context, host string, current *deploy.Site) ([]*deploy.Site, error) {
+	sites := []*deploy.Site{current}
+	if h.config.PreviewStyle == "nested" {
+		return sites, nil
+	}
+	label, ok := strings.CutSuffix(host, "."+h.config.BaseDomain)
+	if !ok || strings.Contains(label, ".") || len(label) > 63 {
+		return nil, errors.New("serving: invalid flat preview hostname")
+	}
+	load := func(name string) error {
+		if name == current.Name || !deploy.ValidName(name) {
+			return nil
+		}
+		site, err := h.catalog.GetSite(ctx, name)
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		sites = append(sites, site)
+		return nil
+	}
+	if err := load(label); err != nil {
+		return nil, err
+	}
+	for at := 0; at+1 < len(label); at++ {
+		if label[at:at+2] == "--" {
+			if err := load(label[at+2:]); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return sites, nil
+}
+
 func applyHeaders(w http.ResponseWriter, headers map[string]string) {
 	for name, value := range headers {
 		w.Header().Set(name, value)
@@ -408,19 +425,48 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request, headers map[s
 	}
 }
 
-func (h *Handler) previousAsset(current route, p string) (*deploy.Release, deploy.File, bool) {
-	now := h.now()
-	for _, old := range current.assets {
-		if !now.Before(old.expires) || !old.engine.Immutable(p) {
-			continue
-		}
-		file, ok := old.release.Files[p]
-		if !ok || htmlAsset(file) || p == "pages.json" {
-			continue
-		}
-		return old.release, file, true
+func (h *Handler) servingRelease(ctx context.Context, site *deploy.Site, id string) (*deploy.ServingRelease, error) {
+	rel, err := h.catalog.GetServingRelease(ctx, site.Owner, site.Name, id)
+	if err != nil {
+		return nil, err
 	}
-	return nil, deploy.File{}, false
+	if !rel.Complete || rel.ID != id || rel.Site != site.Name || rel.Owner != site.Owner || rel.Origin.RepositoryID != site.RepositoryID {
+		return nil, errors.New("serving: invalid release ownership or completion")
+	}
+	return rel, nil
+}
+
+func (h *Handler) previousAsset(ctx context.Context, site *deploy.Site, p string) (*deploy.ServingRelease, *deploy.ServingFile, error) {
+	if p == "pages.json" || htmlAsset(deploy.File{Path: p}) {
+		return nil, nil, nil
+	}
+	now := h.now()
+	var chosen *deploy.ServingRelease
+	var selected *deploy.ServingFile
+	for id, expiry := range site.AssetReleases {
+		if !now.Before(expiry) || id == site.Production {
+			continue
+		}
+		old, err := h.servingRelease(ctx, site, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		if chosen != nil && (old.CreatedAt.Before(chosen.CreatedAt) || (old.CreatedAt.Equal(chosen.CreatedAt) && old.ID >= chosen.ID)) {
+			continue
+		}
+		file, err := h.catalog.GetServingFile(ctx, old, p)
+		if errors.Is(err, storage.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		if !file.Immutable || htmlAsset(file.File) {
+			continue
+		}
+		chosen, selected = old, file
+	}
+	return chosen, selected, nil
 }
 
 func htmlAsset(file deploy.File) bool {

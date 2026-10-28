@@ -15,8 +15,10 @@ of GitHub and of the SQL scaffold. See README.md and docs/mvp.md.
   Publication, local route inspection and HTTP serving share this contract.
 - `internal/githubsync`: discovery, fixed-SHA publication, Git ref selection,
   preview aliases, retention and GC. Policies belong to the source sync.
-- `internal/serving`: reads published snapshots and serves HTTP. It never
-  downloads from a source or makes retention decisions.
+- `internal/serving`: retains only hostname ownership and reads Site, compact
+  release routing and candidate file metadata from Storage on every request.
+  Never add cross-request Site/release/inventory/compiled-engine caches. Bodies
+  stream from Storage. It never downloads from a source or decides retention.
 - `internal/api`: directly implements generated Site/Deployment Get/List over
   the catalog. No SQL Sink, driver binding or generated mutation stack.
 - `internal/app`, `cmd/page`: serving/sync, local route inspection, deployment
@@ -69,7 +71,8 @@ request. Preserve protected URL content across routing changes and rollback.
 Leases protect GC; publication history alone does not.
 
 Retire public references before GC. Check ownership and current references,
-remove the completion manifest before deleting content, and keep the upload
+remove the serving projection and then completion manifest before deleting
+content/sidecars, and keep the upload
 marker until the end so interrupted GC is recoverable. A policy reselecting
 an interrupted deletion must reupload a complete snapshot.
 

@@ -113,7 +113,7 @@ func TestPreviousProductionAssetGraceAndScope(t *testing.T) {
 			t.Fatalf("retention scope %s%s: %d %q", tc.host, tc.target, w.Code, w.Body.String())
 		}
 	}
-	// Expiry is checked for every request, even when the cached routing snapshot
+	// Expiry is checked for every request, even when the hostname namespace
 	// has not yet been refreshed and the old objects still physically exist.
 	now = now.Add(2 * time.Hour)
 	w := request(h, "GET", "foo.example.com", oldURL, nil)
@@ -156,8 +156,8 @@ func TestRoutingFilesRollbackAndDisableTogether(t *testing.T) {
 		"two.html":   "second page",
 	})
 	save(t, c, second, nil)
-	if w := request(h, "GET", "foo.example.com", "/entry", nil); w.Code != 200 || w.Body.String() != "first page" {
-		t.Fatalf("snapshot mixed before refresh: %d %q", w.Code, w.Body.String())
+	if w := request(h, "GET", "foo.example.com", "/entry", nil); w.Code != 200 || w.Body.String() != "second page" {
+		t.Fatalf("fresh routing/file metadata missing: %d %q", w.Code, w.Body.String())
 	}
 	if err := h.Refresh(ctx); err != nil {
 		t.Fatal(err)
