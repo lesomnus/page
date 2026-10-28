@@ -180,6 +180,22 @@ func (c *Catalog) GetServingRelease(ctx context.Context, owner, site, id string)
 	return r, nil
 }
 
+// DecodeServingRelease validates a compact cached descriptor without loading
+// its file inventory. Request routing performs its own structural validation.
+func DecodeServingRelease(data []byte, owner, site, id string) (*ServingRelease, error) {
+	if len(data) > maxServingReleaseMetadata {
+		return nil, ErrInvalid
+	}
+	var release ServingRelease
+	if err := json.Unmarshal(data, &release); err != nil {
+		return nil, fmt.Errorf("%w: cached serving release: %v", ErrInvalid, err)
+	}
+	if err := validateServingRelease(&release, owner, site, id); err != nil {
+		return nil, err
+	}
+	return &release, nil
+}
+
 // GetServingFile does a point read for new releases. A missing sidecar is a
 // missing file, not a reason to load the writer's inventory. Legacy releases
 // stream just one file record out of their bounded manifest instead.

@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/lesomnus/page/internal/deploy"
+	"github.com/lesomnus/page/internal/metacache"
 	"github.com/lesomnus/page/internal/storage"
+	"time"
 )
 
 func TestTagFirstHTTPFallbackAndQualifiedCompatibility(t *testing.T) {
@@ -133,7 +135,8 @@ func TestFreshProductionReservationAfterFailedRefresh(t *testing.T) {
 		tagToken:    {Kind: "tag", Name: "refs/tags/app", Revision: "tag", Release: tag.ID},
 	}
 	save(t, c, prod, aliases)
-	h, err := New(c, Config{BaseDomain: "example.com", PreviewAliasMode: "tag-first"})
+	clock := newCacheClock()
+	h, err := New(c, Config{BaseDomain: "example.com", PreviewAliasMode: "tag-first", MetadataCache: metacache.Config{Now: clock.now, TTL: 5 * time.Second}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,10 +166,14 @@ func TestFreshProductionReservationAfterFailedRefresh(t *testing.T) {
 		t.Fatalf("existing short preview ignored new production reservation: %d", got)
 	}
 	gets, lists, _ := store.counts()
-	if lists != 0 || gets[deploy.SiteKey("bar--foo")] != 1 || gets[deploy.SiteKey("foo")] != 1 || gets[deploy.SiteKey("app--bar--foo")] != 1 || len(gets) != 3 {
-		t.Fatalf("preview read unrelated sites or missed candidate: LIST=%d GET=%v", lists, gets)
+	store.mu.Lock()
+	selectedHeads := store.stats[deploy.SiteKey("bar--foo")]
+	store.mu.Unlock()
+	if lists != 0 || gets[deploy.SiteKey("bar--foo")]+selectedHeads != 1 || gets[deploy.SiteKey("foo")] != 1 || gets[deploy.SiteKey("app--bar--foo")] != 1 || len(gets) != 2 {
+		t.Fatalf("preview read unrelated sites or missed candidate: LIST=%d GET=%v selectedHEAD=%d", lists, gets, selectedHeads)
 	}
 	store.fail(deploy.SiteKey(reserved.Site), true)
+	clock.advance(6 * time.Second)
 	if got := request(h, "GET", host, "/", nil).Code; got != 503 {
 		t.Fatalf("candidate metadata failure became stale winner: %d", got)
 	}
@@ -186,6 +193,7 @@ func TestFreshProductionReservationAfterFailedRefresh(t *testing.T) {
 	if err := base.Delete(context.Background(), deploy.SiteKey(reserved.Site)); err != nil {
 		t.Fatal(err)
 	}
+	clock.advance(6 * time.Second)
 	if got := request(h, "GET", host, "/", nil); got.Code != 200 || got.Body.String() != "branch" {
 		t.Fatalf("missing candidate did not permit branch fallback: %d %q", got.Code, got.Body.String())
 	}

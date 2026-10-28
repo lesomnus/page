@@ -19,30 +19,35 @@ import (
 	"time"
 
 	"github.com/lesomnus/page/internal/deploy"
+	"github.com/lesomnus/page/internal/metacache"
 	"github.com/lesomnus/page/internal/routes"
 	"github.com/lesomnus/page/internal/storage"
 )
 
 type Config struct {
-	BaseDomain       string        `yaml:"base_domain"`
-	PreviewStyle     string        `yaml:"preview_style"`
-	PreviewAliasMode string        `yaml:"preview_alias_mode"`
-	RefreshInterval  time.Duration `yaml:"refresh_interval"`
+	BaseDomain       string           `yaml:"base_domain"`
+	PreviewStyle     string           `yaml:"preview_style"`
+	PreviewAliasMode string           `yaml:"preview_alias_mode"`
+	RefreshInterval  time.Duration    `yaml:"refresh_interval"`
+	MetadataCache    metacache.Config `yaml:"metadata_cache"`
 }
 
-// hostBinding keeps only namespace ownership. Release selection, routing and
-// file metadata are read from Storage for each request.
+// hostBinding keeps only namespace ownership. Publication and release metadata
+// use a separate bounded cache; file inventories and bodies are not retained.
 type hostBinding struct {
 	site, owner, repository string
 }
 type snapshot struct{ routes map[string]hostBinding }
 
 type Handler struct {
-	catalog *deploy.Catalog
-	config  Config
-	refresh sync.Mutex
-	current atomic.Pointer[snapshot]
-	now     func() time.Time
+	catalog         *deploy.Catalog
+	config          Config
+	refresh         sync.Mutex
+	current         atomic.Pointer[snapshot]
+	metadata        *metacache.Cache
+	cacheRevisionMu sync.Mutex
+	cacheRevision   uint64
+	now             func() time.Time
 }
 
 func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
@@ -70,13 +75,18 @@ func New(catalog *deploy.Catalog, config Config) (*Handler, error) {
 	if config.RefreshInterval < 0 {
 		return nil, errors.New("serving: refresh_interval must be positive")
 	}
-	return &Handler{catalog: catalog, config: config, now: time.Now}, nil
+	metadata, err := metacache.New(config.MetadataCache)
+	if err != nil {
+		return nil, fmt.Errorf("serving: metadata cache: %w", err)
+	}
+	return &Handler{catalog: catalog, config: config, metadata: metadata, cacheRevision: catalog.PublicationRevision(), now: time.Now}, nil
 }
 
-// Refresh reconciles hostname ownership without retaining site publications,
-// release inventories or compiled routing. A failed refresh keeps the last
-// namespace index; requests still read their publication metadata from Storage.
+// Refresh reconciles hostname ownership without loading release inventories.
+// Explicit refreshes invalidate mutable cached publications even if listing
+// fails. A failed refresh retains the namespace index, never freshens old data.
 func (h *Handler) Refresh(ctx context.Context) error {
+	h.invalidateMetadata()
 	h.refresh.Lock()
 	defer h.refresh.Unlock()
 	sites, err := h.catalog.ListSites(ctx)
@@ -213,7 +223,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	site, err := h.catalog.GetSite(r.Context(), binding.site)
+	site, err := h.cachedSite(r.Context(), binding.site)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
@@ -251,16 +261,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	rel, err := h.servingRelease(r.Context(), site, id)
-	if err != nil || (revision != "" && revision != rel.Origin.Revision) {
+	compiled, err := h.cachedRelease(r.Context(), site, id)
+	if err != nil || (revision != "" && revision != compiled.release.Origin.Revision) {
 		http.Error(w, "release metadata unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	engine, err := routes.CompileRuntime(rel.Pages)
-	if err != nil {
-		http.Error(w, "routing metadata unavailable", http.StatusServiceUnavailable)
-		return
-	}
+	rel, engine := compiled.release, compiled.engine
 	// Only the handful of candidate paths considered by this request live here.
 	files := map[string]*deploy.ServingFile{}
 	lookup := func(p string) (bool, error) {
@@ -383,7 +389,7 @@ func (h *Handler) previewSites(ctx context.Context, host string, current *deploy
 		if name == current.Name || !deploy.ValidName(name) {
 			return nil
 		}
-		site, err := h.catalog.GetSite(ctx, name)
+		site, err := h.cachedSite(ctx, name)
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil
 		}
@@ -426,14 +432,11 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request, headers map[s
 }
 
 func (h *Handler) servingRelease(ctx context.Context, site *deploy.Site, id string) (*deploy.ServingRelease, error) {
-	rel, err := h.catalog.GetServingRelease(ctx, site.Owner, site.Name, id)
+	compiled, err := h.cachedRelease(ctx, site, id)
 	if err != nil {
 		return nil, err
 	}
-	if !rel.Complete || rel.ID != id || rel.Site != site.Name || rel.Owner != site.Owner || rel.Origin.RepositoryID != site.RepositoryID {
-		return nil, errors.New("serving: invalid release ownership or completion")
-	}
-	return rel, nil
+	return compiled.release, nil
 }
 
 func (h *Handler) previousAsset(ctx context.Context, site *deploy.Site, p string) (*deploy.ServingRelease, *deploy.ServingFile, error) {

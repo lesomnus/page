@@ -38,12 +38,18 @@ func TestCatalogNotificationsFollowSuccessfulWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if c.PublicationRevision() != 0 {
+		t.Fatal("upload advanced publication revision")
+	}
 	assertNoNotice(t, publications) // uploads are not publication boundaries
 	assertNoNotice(t, controls)
 	if err := c.SaveSite(ctx, siteFor(r)); err != nil {
 		t.Fatal(err)
 	}
 	assertNotice(t, publications)
+	if c.PublicationRevision() != 1 {
+		t.Fatal("successful publication was not synchronously observable")
+	}
 	assertNoNotice(t, controls)
 	if s, err := c.GetSite(ctx, "foo"); err != nil || s.Production != r.ID {
 		t.Fatalf("notification preceded publication: %v", err)
@@ -52,6 +58,9 @@ func TestCatalogNotificationsFollowSuccessfulWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNotice(t, controls)
+	if c.PublicationRevision() != 1 {
+		t.Fatal("unapplied control advanced publication revision")
+	}
 	assertNoNotice(t, publications) // only the owner may apply the intent
 }
 
@@ -69,6 +78,9 @@ func TestFailedWriteDoesNotNotify(t *testing.T) {
 		t.Fatal("write unexpectedly succeeded")
 	}
 	assertNoNotice(t, publications)
+	if c.PublicationRevision() != 0 {
+		t.Fatal("failed publication advanced revision")
+	}
 }
 
 func TestNotificationsBroadcastCoalesceAndUnsubscribe(t *testing.T) {

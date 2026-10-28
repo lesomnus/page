@@ -38,14 +38,32 @@ process needs object read/list access; sync also needs write/delete and source
 credentials. Page's durable data lives in S3, so its own container needs no PVC.
 
 `run` refreshes its hostname index after its source commits a publication. The
-default five-minute reconciliation discovers missed hostname changes and new
-sites from other processes. Every HTTP request reads its current Site, compact
-release routing and candidate file metadata from Storage. File inventories and
-compiled routes are not cached between requests; file bodies stream from
-Storage. This reduces resident serving memory at the cost of additional Storage
-requests and routing compilation per HTTP request. Metadata read failures return
-503 rather than serving a cached publication. Source sync can still allocate full
-release inventories temporarily while validating publications and GC. Optional GitHub webhooks
+five-minute reconciliation discovers missed hostname changes and new sites.
+HTTP readers share a bounded metadata cache: Site data has a five-second
+freshness interval and compact immutable release routing is reused by release
+identity. Concurrent cold reads coalesce. Source sync and API reads bypass it.
+
+`metadata_cache.memory_bytes` defaults to 4 MiB of accounted cache weight,
+including a conservative decoded-value estimate; it is not a process RSS limit.
+`disk_bytes` defaults to 64 MiB per storage namespace. `directory` defaults to `/tmp/page-cache`; an
+empty string disables disk caching. The Docker example above mounts `/tmp` as
+`tmpfs`, so its default cache uses RAM. For a disk L2, set `directory` to
+`/var/cache/page` and mount a disk-backed directory or volume writable by UID
+65532 there. Mount a dedicated disk-backed `emptyDir`
+when using a read-only container filesystem. The directory is disposable local
+cache for one serving process, needs UID 65532 write access, and is never exposed
+as static content. It needs no PVC. Cache files are scoped by the S3
+endpoint/bucket/prefix identity. Disk cache failure falls back to memory/origin.
+
+Freshness expiry keeps the cached value. Site ETag revalidation renews unchanged
+data without a GET, and changed data is replaced. Local publication invalidates
+mutable entries immediately. Memory eviction leaves a disk copy; mutable data
+loaded from disk is revalidated, while immutable release descriptors are reused
+without an S3 read. Disk eviction is capacity-based. Origin revalidation failures
+return 503 rather than serving expired Site data. File inventories, per-file
+metadata and bodies stay out of these caches; bodies stream from Storage.
+Source validation and GC can still allocate complete inventories temporarily.
+Optional GitHub webhooks
 use a separate `webhook_listen` port with `GITHUB_WEBHOOK_SECRET` at runtime.
 Forward only `POST /webhooks/github` to that port through HTTPS and keep the
 static-serving and gRPC routes under their existing access policy. See

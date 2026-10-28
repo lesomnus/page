@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lesomnus/page/internal/deploy"
+	"github.com/lesomnus/page/internal/metacache"
 	"github.com/lesomnus/page/internal/routes"
 	"github.com/lesomnus/page/internal/storage"
 )
@@ -22,6 +22,7 @@ type refreshStore struct {
 	storage.Store
 	mu               sync.Mutex
 	gets             map[string]int
+	stats            map[string]int
 	lists, heads     int
 	failKeys         map[string]bool
 	pageLimit        int
@@ -61,8 +62,20 @@ func (s *refreshStore) Get(ctx context.Context, key string) (io.ReadCloser, stor
 func (s *refreshStore) Stat(ctx context.Context, key string) (storage.Info, error) {
 	s.mu.Lock()
 	s.heads++
+	if s.stats == nil {
+		s.stats = map[string]int{}
+	}
+	s.stats[key]++
+	fail := s.failKeys[key]
 	s.mu.Unlock()
-	return s.Store.Stat(ctx, key)
+	if fail {
+		return storage.Info{}, errors.New("injected metadata HEAD failure")
+	}
+	info, err := s.Store.Stat(ctx, key)
+	if s.missingETag {
+		info.ETag = ""
+	}
+	return info, err
 }
 
 func (s *refreshStore) List(ctx context.Context, prefix, cursor string, limit int) (storage.Page, error) {
@@ -96,7 +109,7 @@ func (s *refreshStore) List(ctx context.Context, prefix, cursor string, limit in
 func (s *refreshStore) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.gets, s.lists, s.heads = map[string]int{}, 0, 0
+	s.gets, s.stats, s.lists, s.heads = map[string]int{}, map[string]int{}, 0, 0
 }
 
 func (s *refreshStore) counts() (map[string]int, int, int) {
@@ -167,50 +180,155 @@ func TestRefreshReadsOnlyNamespaceMetadata(t *testing.T) {
 	}
 }
 
-func TestWarmRequestsAlwaysReadStorageMetadata(t *testing.T) {
+type cacheClock struct{ nanos atomic.Int64 }
+
+func newCacheClock() *cacheClock              { c := &cacheClock{}; c.nanos.Store(time.Now().UnixNano()); return c }
+func (c *cacheClock) now() time.Time          { return time.Unix(0, c.nanos.Load()) }
+func (c *cacheClock) advance(d time.Duration) { c.nanos.Add(int64(d)) }
+func handlerWithCache(t *testing.T, c *deploy.Catalog, config metacache.Config) *Handler {
+	t.Helper()
+	h, err := New(c, Config{BaseDomain: "example.com", MetadataCache: config})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+func TestConcurrentRequestsShareSiteReleaseAndCompiledRoutes(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
-	inputs := map[string]string{"index.html": "one"}
+	inputs := map[string]string{"index.html": "one", "pages.json": `{"schemaVersion":1,"headers":[{"from":"/*","set":{"X-Test":"shared"}}]}`}
 	for i := range 1000 {
 		inputs[fmt.Sprintf("unused/%04d.txt", i)] = "unused"
 	}
 	r := publish(t, c, "foo", "one", inputs)
 	save(t, c, r, nil)
 	h := handler(t, c, "")
-	for range 2 {
-		store.reset()
-		if got := request(h, "GET", "foo.example.com", "/", nil); got.Code != 200 || got.Body.String() != "one" {
-			t.Fatalf("request: %d %q", got.Code, got.Body.String())
-		}
-		gets, lists, heads := store.counts()
-		if lists != 0 || heads < 2 || gets[deploy.SiteKey("foo")] != 1 || gets[manifestKey(r)] != 0 {
-			t.Fatalf("request metadata calls: GET=%v LIST=%d HEAD=%d", gets, lists, heads)
-		}
-		if len(gets) != 3 {
-			t.Fatalf("request should read site, compact release and candidate file only: %v", gets)
-		}
+	store.reset()
+	start := make(chan struct{})
+	failures := make(chan string, 50)
+	var workers sync.WaitGroup
+	for range 50 {
+		workers.Go(func() {
+			<-start
+			got := request(h, "GET", "foo.example.com", "/", nil)
+			if got.Code != 200 || got.Body.String() != "one" || got.Header().Get("X-Test") != "shared" {
+				failures <- fmt.Sprintf("%d %q", got.Code, got.Body.String())
+			}
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
+	}
+	gets, lists, _ := store.counts()
+	if lists != 0 || gets[deploy.SiteKey("foo")] != 1 || gets[manifestKey(r)] != 0 {
+		t.Fatalf("burst repeated site or inventory reads: %v LIST%d", gets, lists)
+	}
+	rel, err := c.GetServingRelease(context.Background(), r.Owner, r.Site, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The explicit reader above accounts for the second descriptor GET.
+	gets, _, _ = store.counts()
+	if gets[deploy.ServingReleaseKey(rel)] != 2 || gets[deploy.ServingFileKey(rel, "index.html")] != 50 || len(gets) != 3 {
+		t.Fatalf("burst did not share descriptor or cached file inventory: %v", gets)
+	}
+	site, err := h.cachedSite(context.Background(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := h.cachedRelease(context.Background(), site, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.cachedRelease(context.Background(), site, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.engine != second.engine || first.release != second.release {
+		t.Fatal("warm request recompiled routes")
 	}
 }
 
-func TestMetadataFailuresNeverServeStaleConfiguration(t *testing.T) {
+func TestExpiredSiteRevalidatesWithoutDeletingOrRepeatingGET(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
 	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, r, nil)
-	h := handler(t, c, "")
+	clock := newCacheClock()
+	h := handlerWithCache(t, c, metacache.Config{Now: clock.now, TTL: 5 * time.Second})
+	first, err := h.cachedSite(context.Background(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
 	store.reset()
+	clock.advance(6 * time.Second)
+	second, err := h.cachedSite(context.Background(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gets, _, heads := store.counts()
+	if first != second || len(gets) != 0 || heads != 1 {
+		t.Fatalf("TTL discarded unchanged decoded metadata: same=%v GET%v HEAD%d", first == second, gets, heads)
+	}
+	// An external process changes Storage without local publication notifications.
+	changed, err := c.GetSite(context.Background(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.Disabled = true
+	rawSite(t, store.Store, changed)
+	store.reset()
+	if got, err := h.cachedSite(context.Background(), "foo"); err != nil || got.Disabled {
+		t.Fatal("cache ignored its freshness TTL")
+	}
+	clock.advance(6 * time.Second)
+	got, err := h.cachedSite(context.Background(), "foo")
+	if err != nil || !got.Disabled {
+		t.Fatalf("changed ETag not reloaded: %v", err)
+	}
+	gets, _, heads = store.counts()
+	if gets[deploy.SiteKey("foo")] != 1 || heads != 1 {
+		t.Fatalf("changed metadata calls: GET%v HEAD%d", gets, heads)
+	}
+}
+
+func TestFreshCacheSurvivesOriginFailureButExpiredSiteDoesNotServeStale(t *testing.T) {
+	store := &refreshStore{Store: storage.NewMemory()}
+	c := deploy.New(store)
+	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
+	save(t, c, r, nil)
+	clock := newCacheClock()
+	h := handlerWithCache(t, c, metacache.Config{Now: clock.now, TTL: 5 * time.Second})
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
 		t.Fatal(got)
 	}
-	gets, _, _ := store.counts()
-	for key := range gets {
-		t.Run(key, func(t *testing.T) {
-			store.fail(key, true)
-			if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != http.StatusServiceUnavailable {
-				t.Fatalf("metadata failure used stale values: %d", got)
-			}
-			store.fail(key, false)
-		})
+	rel, err := c.GetServingRelease(context.Background(), r.Owner, r.Site, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.fail(deploy.SiteKey("foo"), true)
+	store.fail(deploy.ServingReleaseKey(rel), true)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
+		t.Fatalf("fresh validated cache consulted failed origin: %d", got)
+	}
+	clock.advance(6 * time.Second)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
+		t.Fatalf("expired Site hid failed revalidation: %d", got)
+	}
+	store.fail(deploy.SiteKey("foo"), false)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
+		t.Fatalf("unchanged immutable release was needlessly reloaded: %d", got)
+	}
+	store.fail(deploy.ServingFileKey(rel, "index.html"), true)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
+		t.Fatalf("uncached file metadata failure swallowed: %d", got)
 	}
 }
 
@@ -220,7 +338,8 @@ func TestFreshSiteChangesRevokeWithoutNamespaceRefresh(t *testing.T) {
 	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	token := deploy.AliasToken("branch", "dev")
 	save(t, c, first, map[string]deploy.Alias{token: {Kind: "branch", Name: "dev", Revision: "one", Release: first.ID}})
-	h := handler(t, c, "")
+	clock := newCacheClock()
+	h := handlerWithCache(t, c, metacache.Config{Now: clock.now, TTL: 5 * time.Second})
 	store.failLists.Store(true)
 	second := publish(t, c, "foo", "two", map[string]string{"index.html": "two"})
 	save(t, c, second, nil)
@@ -239,6 +358,7 @@ func TestFreshSiteChangesRevokeWithoutNamespaceRefresh(t *testing.T) {
 	}
 	site.Disabled = true
 	rawSite(t, store.Store, site)
+	clock.advance(6 * time.Second)
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
 		t.Fatalf("disabled site still served: %d", got)
 	}
@@ -521,6 +641,9 @@ func TestCorruptServingMetadataReturnsUnavailable(t *testing.T) {
 	put(deploy.ServingFileKey(rel, "index.html"), file)
 	rel.Pages = &routes.Config{SchemaVersion: 1, Headers: []routes.HeaderRule{{From: "/*", Set: map[string]string{"Set-Cookie": "secret"}}}}
 	put(deploy.ServingReleaseKey(rel), rel)
+	// A cold reader must validate immutable routing from Storage. A warm reader
+	// deliberately trusts the already completed immutable release identity.
+	h = handler(t, c, "")
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
 		t.Fatalf("unsafe routing metadata: %d", got)
 	}
@@ -544,7 +667,7 @@ func TestDeclaredMissingBodyDoesNotBecomeSPAFallback(t *testing.T) {
 	}
 }
 
-func TestLegacyHTTPReadsMetadataOnEveryRequest(t *testing.T) {
+func TestLegacyHTTPStreamsFilesAndDiscoversProjectionBackfill(t *testing.T) {
 	base := storage.NewMemory()
 	store := &refreshStore{Store: base}
 	c := deploy.New(store)
@@ -561,17 +684,31 @@ func TestLegacyHTTPReadsMetadataOnEveryRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	save(t, c, r, nil)
-	h := handler(t, c, "")
+	clock := newCacheClock()
+	h := handlerWithCache(t, c, metacache.Config{Now: clock.now, TTL: 5 * time.Second})
 	for range 2 {
 		store.reset()
 		if got := request(h, "GET", "foo.example.com", "/about", nil); got.Code != 200 || got.Body.String() != "about" {
 			t.Fatalf("legacy clean URL: %d %q", got.Code, got.Body.String())
 		}
 		gets, _, _ := store.counts()
-		if gets[manifestKey(r)] < 2 || gets[deploy.FileKey(r, "pages.json")] < 2 {
-			t.Fatalf("legacy metadata was cached: %v", gets)
+		if gets[manifestKey(r)] < 1 || gets[deploy.FileKey(r, "pages.json")] < 1 {
+			t.Fatalf("legacy file record was not streamed: %v", gets)
 		}
 	}
+	if err := c.EnsureServingProjection(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	clock.advance(6 * time.Second)
+	store.reset()
+	if got := request(h, "GET", "foo.example.com", "/about", nil); got.Code != 200 || got.Body.String() != "about" {
+		t.Fatalf("backfilled legacy route: %d %q", got.Code, got.Body.String())
+	}
+	gets, _, _ := store.counts()
+	if gets[manifestKey(r)] != 0 || gets[deploy.FileKey(r, "pages.json")] != 0 {
+		t.Fatalf("legacy cache never discovered projection: %v", gets)
+	}
+
 }
 
 func TestPreviousAssetsUseNewestLeaseAndPropagateMetadataFailure(t *testing.T) {
@@ -614,8 +751,12 @@ func TestPreviousAssetsUseNewestLeaseAndPropagateMetadataFailure(t *testing.T) {
 	}
 	store.fail(deploy.ServingFileKey(rel, "assets/app.js"), false)
 	store.fail(deploy.ServingReleaseKey(rel), true)
-	if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 503 {
-		t.Fatalf("old release metadata failure became not found/stale asset: %d", got)
+	if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 200 {
+		t.Fatalf("cached immutable release reloaded unnecessarily: %d", got)
+	}
+	cold := handler(t, c, "")
+	if got := request(cold, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 503 {
+		t.Fatalf("cold old release metadata failure became not found/stale asset: %d", got)
 	}
 	h.now = func() time.Time { return until.Add(time.Second) }
 	if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 404 {

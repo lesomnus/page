@@ -15,10 +15,13 @@ of GitHub and of the SQL scaffold. See README.md and docs/mvp.md.
   Publication, local route inspection and HTTP serving share this contract.
 - `internal/githubsync`: discovery, fixed-SHA publication, Git ref selection,
   preview aliases, retention and GC. Policies belong to the source sync.
-- `internal/serving`: retains only hostname ownership and reads Site, compact
-  release routing and candidate file metadata from Storage on every request.
-  Never add cross-request Site/release/inventory/compiled-engine caches. Bodies
-  stream from Storage. It never downloads from a source or decides retention.
+- `internal/metacache`: bounded read-only metadata L1/L2 with singleflight,
+  mutable freshness revalidation and atomic disposable disk records. Freshness
+  expiry does not delete entries. Keep source/writer reads outside this cache.
+- `internal/serving`: hostname ownership plus bounded Site/compact-release/route
+  metadata caches. Never retain complete file inventories or response bodies.
+  Publication invalidates mutable metadata; leases expire on every request.
+  It never downloads from a source or makes retention decisions.
 - `internal/api`: directly implements generated Site/Deployment Get/List over
   the catalog. No SQL Sink, driver binding or generated mutation stack.
 - `internal/app`, `cmd/page`: serving/sync, local route inspection, deployment
