@@ -37,7 +37,7 @@ func TestTagFirstPreviewSelection(t *testing.T) {
 		t.Fatalf("tag did not win: %+v", plan)
 	}
 	if len(plan.Routes) != 4 || len(plan.Problems) != 1 || plan.Problems[0].Kind != "branch" {
-		t.Fatalf("legacy/commit routes or diagnostic lost: %+v", plan)
+		t.Fatalf("qualified/commit routes or diagnostic lost: %+v", plan)
 	}
 	if r := primaryHost(plan, Host("example.com", "flat", "app", AliasToken("commit", commit.Name))); r == nil || r.Alias != commit {
 		t.Fatal("commit URL changed")
@@ -124,15 +124,15 @@ func TestTagFirstCannotTakeProductionOrQualifiedNames(t *testing.T) {
 			t.Fatalf("production name was stolen (disabled=%v): %+v %v", disabled, plan, err)
 		}
 	}
-	legacy := AliasToken(branch.Kind, branch.Name)
-	tag := Alias{Kind: "tag", Name: "refs/tags/" + legacy}
+	qualified := AliasToken(branch.Kind, branch.Name)
+	tag := Alias{Kind: "tag", Name: "refs/tags/" + qualified}
 	s := previewSite("app", branch, tag)
 	plan, err := PlanPreviews([]*Site{s}, "example.com", "flat", PreviewAliasTagFirst)
 	if err != nil || len(plan.Problems) != 1 {
 		t.Fatalf("qualified collision not diagnosed: %+v %v", plan, err)
 	}
 	for _, r := range plan.Routes {
-		if r.Host == Host("example.com", "flat", "app", legacy) && (r.Alias != branch || r.Primary) {
+		if r.Host == Host("example.com", "flat", "app", qualified) && (r.Alias != branch || r.Primary) {
 			t.Fatalf("tag changed a qualified branch address: %+v", r)
 		}
 	}

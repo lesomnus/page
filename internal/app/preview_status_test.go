@@ -55,7 +55,7 @@ func TestStatusDescribesTagFirstSelectionAndFallback(t *testing.T) {
 	if len(got.Previews) != 1 || got.Previews[0] != (preview{"tag", "refs/tags/release", "tag", "https://release--app.example.com"}) {
 		t.Fatalf("selected preview: %#v", got.Previews)
 	}
-	if len(got.PreviewProblems) != 1 || got.PreviewProblems[0].Kind != "branch" || got.PreviewProblems[0].LegacyURL != "https://"+deploy.Host("example.com", "flat", "app", branchToken) {
+	if len(got.PreviewProblems) != 1 || got.PreviewProblems[0].Kind != "branch" || got.PreviewProblems[0].QualifiedURL != "https://"+deploy.Host("example.com", "flat", "app", branchToken) {
 		t.Fatalf("hidden branch: %#v", got.PreviewProblems)
 	}
 	got = status("")

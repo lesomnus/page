@@ -291,9 +291,11 @@ func (s *Sync) syncRepository(ctx context.Context, repo repository, name string)
 	}
 	sort.Strings(shas)
 	published := map[string]*deploy.Release{}
+	missingManifest := map[string]bool{}
 	for _, sha := range shas {
 		r, err := s.publish(ctx, repo, name, sha)
 		if errors.Is(err, errNoManifest) {
+			missingManifest[sha] = true
 			slog.InfoContext(ctx, "revision has no deployment manifest", "repository", repo.FullName, "revision", sha)
 			continue
 		}
@@ -314,15 +316,15 @@ func (s *Sync) syncRepository(ctx context.Context, repo repository, name string)
 		token := deploy.AliasToken(ref.kind, ref.name)
 		if r := published[ref.sha]; r != nil {
 			aliases[token] = deploy.Alias{Kind: ref.kind, Name: ref.name, Revision: ref.sha, Release: r.ID}
-		} else if old, ok := site.Aliases[token]; ok {
+		} else if old, ok := site.Aliases[token]; ok && !missingManifest[ref.sha] {
 			aliases[token] = old
 		}
 	}
 	for sha, r := range published {
 		aliases[deploy.AliasToken("commit", sha)] = deploy.Alias{Kind: "commit", Name: sha, Revision: sha, Release: r.ID}
 	}
-	// Preserve a stable commit URL for a selected ref whose newer publication
-	// failed or lost its manifest, while keeping that ref's last good snapshot.
+	// Keep the stable commit URL of any retained selected ref. A ref without
+	// the configured deployment manifest was deliberately excluded above.
 	for _, a := range aliases {
 		if a.Kind != "commit" {
 			aliases[deploy.AliasToken("commit", a.Revision)] = deploy.Alias{Kind: "commit", Name: a.Revision, Revision: a.Revision, Release: a.Release}

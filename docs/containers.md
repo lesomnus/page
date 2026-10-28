@@ -41,7 +41,7 @@ credentials. Page's durable data lives in S3, so its own container needs no PVC.
 five-minute reconciliation discovers missed hostname changes and new sites.
 HTTP readers share a bounded metadata cache: Site data has a five-second
 freshness interval and compact immutable release routing is reused by release
-identity. Concurrent cold reads coalesce. Source sync and API reads bypass it.
+identity and Site publication timestamp. Concurrent cold reads coalesce. Source sync and API reads bypass it.
 
 `metadata_cache.memory_bytes` defaults to 4 MiB of accounted cache weight,
 including a conservative decoded-value estimate; it is not a process RSS limit.

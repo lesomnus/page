@@ -29,6 +29,13 @@ of GitHub and of the SQL scaffold. See README.md and docs/mvp.md.
 - `cmd/scaffold`, `cli`, `cmd/*.go`, `ts/src`: retained upstream SQL/React
   example; use examples/scaffold.yaml. The product does not import its wiring.
 
+## Compatibility before v1.0.0
+
+Before v1.0.0, support the current resource and storage formats. Do not add
+fallback readers, migrations or API branches solely to preserve older formats.
+Update examples, fixtures and deployment configuration with contract changes.
+Check active production metadata when deploying a format change.
+
 ## Generate and verify
 
 ```sh
@@ -74,7 +81,7 @@ request. Preserve protected URL content across routing changes and rollback.
 Leases protect GC; publication history alone does not.
 
 Retire public references before GC. Check ownership and current references,
-remove the serving projection and then completion manifest before deleting
+remove the completion manifest and then serving projection before deleting
 content/sidecars, and keep the upload
 marker until the end so interrupted GC is recoverable. A policy reselecting
 an interrupted deletion must reupload a complete snapshot.

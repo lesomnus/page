@@ -4,16 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/lesomnus/page/internal/deploy"
 	"github.com/lesomnus/page/internal/metacache"
 	"github.com/lesomnus/page/internal/routes"
 )
-
-// A projection is immutable under its owner/site/release identity. Legacy
-// descriptors deliberately have no marker so a later source backfill is found
-// after the short freshness interval or the next publication notification.
-const projectionValidator = "page-serving-projection-v1"
 
 type compiledRelease struct {
 	release *deploy.ServingRelease
@@ -68,22 +64,20 @@ func (h *Handler) cachedSite(ctx context.Context, name string) (*deploy.Site, er
 
 func (h *Handler) cachedRelease(ctx context.Context, site *deploy.Site, id string) (*compiledRelease, error) {
 	h.observePublications()
-	value, err := h.metadata.Get(ctx, deploy.ReleasePrefix(site.Owner, site.Name, id)+"serving.json", metacache.Policy{
-		// Modern descriptors only need the local identity validator below.
-		// Marking both formats mutable lets legacy descriptors discover a newly
-		// backfilled projection without adding another cache lifetime mechanism.
-		Mutable: true,
+	// A retired release can be collected and later published again with the
+	// same source identity and ID but a new CreatedAt. Scope immutable cached
+	// metadata to the publication that selected it, so both memory and disk
+	// tiers load the new incarnation after a later Site write.
+	key := deploy.ReleasePrefix(site.Owner, site.Name, id) + "serving.json@" + site.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	value, err := h.metadata.Get(ctx, key, metacache.Policy{
+		Mutable: false,
 		Load: func(ctx context.Context) ([]byte, string, error) {
 			release, err := h.catalog.GetServingRelease(ctx, site.Owner, site.Name, id)
 			if err != nil {
 				return nil, "", err
 			}
 			data, err := json.Marshal(release)
-			validator := ""
-			if release.FileMetadataVersion == 1 {
-				validator = projectionValidator
-			}
-			return data, validator, err
+			return data, "", err
 		},
 		Decode: func(data []byte) (any, error) {
 			release, err := deploy.DecodeServingRelease(data, site.Owner, site.Name, id)
@@ -95,9 +89,6 @@ func (h *Handler) cachedRelease(ctx context.Context, site *deploy.Site, id strin
 				return nil, err
 			}
 			return &compiledRelease{release: release, engine: engine}, nil
-		},
-		Revalidate: func(_ context.Context, etag string) (bool, error) {
-			return etag == projectionValidator, nil
 		},
 	})
 	if err != nil {

@@ -667,50 +667,6 @@ func TestDeclaredMissingBodyDoesNotBecomeSPAFallback(t *testing.T) {
 	}
 }
 
-func TestLegacyHTTPStreamsFilesAndDiscoversProjectionBackfill(t *testing.T) {
-	base := storage.NewMemory()
-	store := &refreshStore{Store: base}
-	c := deploy.New(store)
-	r := publish(t, c, "foo", "legacy", map[string]string{"index.html": "legacy", "about.html": "about", "pages.json": `{"schemaVersion":1,"routing":{"cleanUrls":true}}`})
-	r.Pages = nil
-	body, err := json.Marshal(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := base.Put(context.Background(), manifestKey(r), strings.NewReader(string(body)), int64(len(body)), "application/json"); err != nil {
-		t.Fatal(err)
-	}
-	if err := base.Delete(context.Background(), deploy.ReleasePrefix(r.Owner, r.Site, r.ID)+"serving.json"); err != nil {
-		t.Fatal(err)
-	}
-	save(t, c, r, nil)
-	clock := newCacheClock()
-	h := handlerWithCache(t, c, metacache.Config{Now: clock.now, TTL: 5 * time.Second})
-	for range 2 {
-		store.reset()
-		if got := request(h, "GET", "foo.example.com", "/about", nil); got.Code != 200 || got.Body.String() != "about" {
-			t.Fatalf("legacy clean URL: %d %q", got.Code, got.Body.String())
-		}
-		gets, _, _ := store.counts()
-		if gets[manifestKey(r)] < 1 || gets[deploy.FileKey(r, "pages.json")] < 1 {
-			t.Fatalf("legacy file record was not streamed: %v", gets)
-		}
-	}
-	if err := c.EnsureServingProjection(context.Background(), r); err != nil {
-		t.Fatal(err)
-	}
-	clock.advance(6 * time.Second)
-	store.reset()
-	if got := request(h, "GET", "foo.example.com", "/about", nil); got.Code != 200 || got.Body.String() != "about" {
-		t.Fatalf("backfilled legacy route: %d %q", got.Code, got.Body.String())
-	}
-	gets, _, _ := store.counts()
-	if gets[manifestKey(r)] != 0 || gets[deploy.FileKey(r, "pages.json")] != 0 {
-		t.Fatalf("legacy cache never discovered projection: %v", gets)
-	}
-
-}
-
 func TestPreviousAssetsUseNewestLeaseAndPropagateMetadataFailure(t *testing.T) {
 	base := storage.NewMemory()
 	store := &refreshStore{Store: base}

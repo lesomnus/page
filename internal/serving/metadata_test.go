@@ -146,3 +146,60 @@ func TestCacheConfigRejectsNegativeBudgetsAndTTL(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectedReleaseRepublishedWithSameIDDoesNotReuseOldMetadata(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(map[bool]string{false: "memory", true: "disk-restart"}[restart], func(t *testing.T) {
+			ctx := context.Background()
+			c := deploy.New(storage.NewMemory())
+			files := map[string]string{"index.html": "fixed revision content"}
+			first := publish(t, c, "foo", "same-revision", files)
+			save(t, c, first, nil)
+			config := metacache.Config{Directory: t.TempDir(), Namespace: "republish-test"}
+			h := handlerWithCache(t, c, config)
+			if got := request(h, "GET", "foo.example.com", "/", nil); got.Code != 200 || got.Body.String() != files["index.html"] {
+				t.Fatalf("initial publication: %d %q", got.Code, got.Body.String())
+			}
+			before, err := c.GetSite(ctx, "foo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			withdrawn := *before
+			withdrawn.Production = ""
+			withdrawn.Aliases = nil
+			if err := c.SaveSite(ctx, &withdrawn); err != nil {
+				t.Fatal(err)
+			}
+			if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
+				t.Fatalf("withdrawn publication still served: %d", got)
+			}
+			if err := c.DeleteRelease(ctx, &withdrawn, first.ID); err != nil {
+				t.Fatal(err)
+			}
+			second := publish(t, c, "foo", "same-revision", files)
+			if first.ID != second.ID || first.CreatedAt.Equal(second.CreatedAt) {
+				t.Fatal("fixture did not recreate the same release ID with a new creation time")
+			}
+			save(t, c, second, nil)
+			after, err := c.GetSite(ctx, "foo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if before.UpdatedAt.Equal(after.UpdatedAt) {
+				t.Fatal("publication did not advance its metadata cache identity")
+			}
+			if restart {
+				// The disk still contains the old completed descriptor. A fresh
+				// process must select a different key using the current Site.
+				h = handlerWithCache(t, c, config)
+			}
+			if got := request(h, "GET", "foo.example.com", "/", nil); got.Code != 200 || got.Body.String() != files["index.html"] {
+				t.Fatalf("republished release reused old creation metadata: %d %q", got.Code, got.Body.String())
+			}
+			cached, err := h.cachedRelease(ctx, after, second.ID)
+			if err != nil || !cached.release.CreatedAt.Equal(second.CreatedAt) {
+				t.Fatalf("cached descriptor does not describe the new release incarnation: %v", err)
+			}
+		})
+	}
+}

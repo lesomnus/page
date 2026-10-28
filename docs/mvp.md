@@ -91,9 +91,8 @@ publish:
 스키마 버전은 1이고 게시 디렉터리는 레포 내 상대 경로이며 `.`도 허용한다. 배포 파일과 게시 파일은
 같은 전체 SHA에서 읽는다. 알 수 없는 필드·중복 키·여러 YAML 문서·64 KiB 초과 파일은 거부한다.
 
-기본 경로에서 `page.yaml`이 404이면 과거 커밋의 preview를 유지하기 위해 이전 `manifest.json`을 읽는다.
-`page.yaml`이 존재하지만 잘못됐으면 이전 파일로 우회하지 않는다. `manifest_path`로 다른 경로를 지정하면
-그 파일만 읽는다. 새 배포 파일은 `page.yaml`을 사용한다.
+기본 배포 설정은 `page.yaml`만 읽는다. 없으면 해당 커밋은 배포 대상에서 제외한다.
+`manifest_path`로 다른 경로를 명시한 경우에는 그 파일만 읽으며 자동 fallback은 없다.
 빌드를 실행하지 않으며 게시 디렉터리의 symlink·특수 파일·경로 탈출을 거부한다.
 
 시작·정기 polling 때는 전체 저장소 목록을 탐색한다. 설정한 webhook은 알림에 지정된
@@ -122,9 +121,9 @@ Storage의 `manifest.json`은 서버가 작성하는 릴리스 메타데이터�
 사이트 객체에는 운영·preview 참조와 GC 대기 상태를 기록한다.
 `serving.json`에는 파일 목록 없이 릴리스 식별 정보와 라우팅 설정만 기록한다. 각 파일의
 크기·MIME·SHA-256·immutable 여부는 경로를 해시한 `metadata/` 객체로 따로 읽는다.
-본문과 이 메타데이터를 업로드한 뒤 완료 manifest를 기록하며, 서빙도 매번 manifest의
-존재를 확인한다. 이전 형식은 manifest를 스트리밍 해석해 파일 하나씩 읽고, 기존 완료
-릴리스를 sync가 재사용할 때 새 서빙 메타데이터를 보충한다.
+본문과 이 메타데이터를 업로드한 뒤 완료 manifest를 기록한다. 캐시가 없는 최초 조회는
+완료 manifest의 존재와 현재 descriptor 형식을 확인한다. `serving.json`과 파일별 메타데이터가
+없는 이전 Storage 형식은 지원하지 않는다.
 
 ## pages.json 라우팅
 
@@ -247,8 +246,8 @@ go run ./cmd/page remove foo
 
 ## preview와 보존
 
-branch/tag 별칭은 해당 ref의 최신 성공 배포를 가리킨다. 새 배포가 실패하면 이전
-성공 배포를 유지한다. commit 별칭은 전체 SHA에 고정되며 같은 snapshot은 공유한다.
+branch/tag 별칭은 해당 ref의 최신 성공 배포를 가리킨다. 설정이 있지만 새 배포가 실패하면
+이전 성공 배포를 유지한다. 설정 파일이 없는 커밋의 preview는 제외한다. commit 별칭은 전체 SHA에 고정되며 같은 snapshot은 공유한다.
 기본 `preview_alias_mode: qualified`는 `b-`, `t-`, `c-` 종류 접두사, 안전한 slug와
 해시로 별칭을 구성한다. 원래 ref와 전체 SHA는 metadata에 남는다. 다음 명령은 Storage만 읽어 사이트·운영 URL과
 preview별 ref·SHA·정확한 URL을 JSON으로 출력한다. HTTP/gRPC 서버가 실행 중일
@@ -280,8 +279,8 @@ flat URL은 `<별칭>--foo.example.com`, nested URL은 `<별칭>.foo.example.com
 tag끼리 모호한 경우 branch로 대신 제공하지 않는다. DNS 길이 제한을 넘거나 다른
 사이트의 운영 주소·기존 별칭 주소와 충돌해도 짧은 주소를 제공하지 않는다.
 `status`는 선택한 짧은 URL과 commit URL을 `previews`에 출력하고, 짧은 주소를 쓰지
-못한 ref는 이유와 기존 URL을 `previewProblems`에 출력한다. 기존 접두사·해시가
-있는 branch/tag URL은 계속 동작하며 commit URL은 바뀌지 않는다. 이 설정은 URL
+못한 ref는 이유와 qualified URL을 `previewProblems`에 출력한다. 종류 접두사·해시가
+있는 qualified branch/tag 주소와 commit 주소도 제공한다. 이 설정은 URL
 선택만 바꾸며 ref 보존 정책과 Storage metadata 형식은 바꾸지 않는다.
 
 현재 운영 배포, 선택 branch/tag의 최신 성공 배포와 최근 N개 선택 커밋의 배포를
@@ -348,8 +347,8 @@ metadata_cache:
 알림 처리를 기다리지 않고 새 요청에서 확인한다. 다른 프로세스의 변경은 freshness 주기
 안에 발견한다. preview는 같은 호스트를 예약할 수 있는 사이트들도 같은 방식으로 확인한다.
 
-완료된 `serving.json`과 해석한 라우팅은 소유자·사이트·불변 릴리스 ID로 재사용한다.
-이전 형식의 descriptor는 짧은 주기로 다시 읽어 새 serving projection 보충을 발견한다.
+완료된 `serving.json`과 해석한 라우팅은 소유자·사이트·릴리스 ID·사이트 게시 시각으로
+재사용한다. 같은 Git 커밋이 GC 후 재게시돼도 새 descriptor와 파일 메타데이터를 함께 읽는다.
 파일 경로 후보만 Storage에서 조회하고, 선택된 본문을 스트리밍하며 SHA-256 ETag를 유지한다.
 이전 운영 자산의 lease 만료는 캐시와 무관하게 요청마다 검사한다.
 

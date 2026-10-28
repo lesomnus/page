@@ -18,8 +18,6 @@ type projectionStore struct {
 	storage.Store
 	puts, gets, stats, deletes []string
 	failPut, failDelete        string
-	maxRead, bytesRead         int
-	ignoreManifestSize         bool
 }
 
 func (s *projectionStore) Put(ctx context.Context, key string, body io.Reader, size int64, typ string) (storage.Info, error) {
@@ -36,21 +34,12 @@ func (s *projectionStore) Get(ctx context.Context, key string) (io.ReadCloser, s
 	if err != nil {
 		return nil, info, err
 	}
-	if strings.HasSuffix(key, "/manifest.json") {
-		if s.ignoreManifestSize {
-			info.Size = 0
-		}
-		body = &projectionReadCloser{ReadCloser: body, store: s}
-	}
 	return body, info, nil
 }
 
 func (s *projectionStore) Stat(ctx context.Context, key string) (storage.Info, error) {
 	s.stats = append(s.stats, key)
 	info, err := s.Store.Stat(ctx, key)
-	if s.ignoreManifestSize && strings.HasSuffix(key, "/manifest.json") {
-		info.Size = 0
-	}
 	return info, err
 }
 
@@ -60,18 +49,6 @@ func (s *projectionStore) Delete(ctx context.Context, key string) error {
 		return errors.New("projection deletion interrupted")
 	}
 	return s.Store.Delete(ctx, key)
-}
-
-type projectionReadCloser struct {
-	io.ReadCloser
-	store *projectionStore
-}
-
-func (r *projectionReadCloser) Read(p []byte) (int, error) {
-	r.store.maxRead = max(r.store.maxRead, len(p))
-	n, err := r.ReadCloser.Read(p)
-	r.store.bytesRead += n
-	return n, err
 }
 
 func newProjectionCatalog() (*Catalog, *projectionStore) {
@@ -233,61 +210,6 @@ func TestServingProjectionValidatesFileEnvelopeAndOriginalPath(t *testing.T) {
 	}
 }
 
-func removeProjection(t *testing.T, ctx context.Context, c *Catalog, r *Release) {
-	t.Helper()
-	header := servingRelease(r)
-	if err := c.Store.Delete(ctx, ServingReleaseKey(header)); err != nil {
-		t.Fatal(err)
-	}
-	for p := range r.Files {
-		if err := c.Store.Delete(ctx, ServingFileKey(header, p)); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func TestLegacyServingAndPublisherBackfill(t *testing.T) {
-	ctx := context.Background()
-	c, store := newProjectionCatalog()
-	r, err := c.Publish(ctx, "foo", "source", origin("legacy"), projectFiles())
-	if err != nil {
-		t.Fatal(err)
-	}
-	removeProjection(t, ctx, c, r)
-	header, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID)
-	if err != nil || header.FileMetadataVersion != 0 {
-		t.Fatalf("legacy release is unreadable: %#v %v", header, err)
-	}
-	f, err := c.GetServingFile(ctx, header, "assets/app.abc.js")
-	if err != nil || !f.Immutable || f.File != r.Files["assets/app.abc.js"] {
-		t.Fatalf("legacy file or immutable policy lost: %#v %v", f, err)
-	}
-	if _, err := c.GetServingFile(ctx, header, "missing.js"); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("missing legacy file: %v", err)
-	}
-	store.puts = nil
-	files := projectFiles()
-	for i := range files {
-		files[i].Open = func() (io.ReadCloser, error) { return nil, errors.New("must reuse completed content") }
-	}
-	again, err := c.Publish(ctx, r.Site, r.Owner, r.Origin, files)
-	if err != nil || !again.CreatedAt.Equal(r.CreatedAt) {
-		t.Fatalf("backfill did not reuse completed release: %#v %v", again, err)
-	}
-	for _, key := range store.puts {
-		if strings.Contains(key, "/files/") || strings.HasSuffix(key, "/manifest.json") {
-			t.Fatalf("backfill rewrote completed content: %s", key)
-		}
-	}
-	header, err = c.GetServingRelease(ctx, r.Owner, r.Site, r.ID)
-	if err != nil || header.FileMetadataVersion != fileMetadataVersion {
-		t.Fatalf("publisher did not backfill projection: %#v %v", header, err)
-	}
-	if _, err := c.GetServingFile(ctx, header, "assets/app.abc.js"); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestServingProjectionGCWithdrawsBothCompletionObjectsFirst(t *testing.T) {
 	ctx := context.Background()
 	c, store := newProjectionCatalog()
@@ -306,7 +228,7 @@ func TestServingProjectionGCWithdrawsBothCompletionObjectsFirst(t *testing.T) {
 		t.Fatal("expected interrupted GC")
 	}
 	prefix := ReleasePrefix(r.Owner, r.Site, r.ID)
-	if len(store.deletes) < 3 || store.deletes[0] != prefix+"serving.json" || store.deletes[1] != prefix+"manifest.json" {
+	if len(store.deletes) < 3 || store.deletes[0] != prefix+"manifest.json" || store.deletes[1] != prefix+"serving.json" {
 		t.Fatalf("GC deleted data before withdrawing both completion objects: %v", store.deletes)
 	}
 	if _, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID); !errors.Is(err, storage.ErrNotFound) {
@@ -364,95 +286,98 @@ func TestMissingManifestForcesProjectionRebuild(t *testing.T) {
 	}
 }
 
-func TestLegacyServingStreamsLargeInventoryWithBoundedReadBuffer(t *testing.T) {
+func TestServingProjectionRequiredWithoutManifestFallback(t *testing.T) {
 	ctx := context.Background()
 	c, store := newProjectionCatalog()
-	o := origin("large-legacy")
-	r := &Release{SchemaVersion: SchemaVersion, ID: ReleaseID("source", "foo", o), Site: "foo", Owner: "source", Origin: o, CreatedAt: time.Now().UTC(), Complete: true, Files: map[string]File{}}
-	for i := range 20000 {
-		p := fmt.Sprintf("assets/%06d.js", i)
-		r.Files[p] = File{Path: p, Size: 1, ContentType: "application/javascript", SHA256: strings.Repeat("a", 64)}
-	}
-	if err := c.write(ctx, ReleasePrefix(r.Owner, r.Site, r.ID)+"manifest.json", r); err != nil {
-		t.Fatal(err)
-	}
-	header, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID)
+	r, err := c.Publish(ctx, "foo", "source", origin("required-projection"), projectFiles())
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := c.GetServingFile(ctx, header, "assets/019999.js")
-	if err != nil || f.File != r.Files["assets/019999.js"] {
-		t.Fatalf("legacy point lookup lost record: %#v %v", f, err)
-	}
-	if store.maxRead > 64<<10 || store.bytesRead < 2<<20 {
-		t.Fatalf("inventory was not streamed with a bounded buffer: max read=%d total=%d", store.maxRead, store.bytesRead)
-	}
-}
-
-func TestLegacyServingEnforcesActualMetadataLimit(t *testing.T) {
-	ctx := context.Background()
-	c, store := newProjectionCatalog()
-	r, err := c.Publish(ctx, "foo", "source", origin("large-tail"), []InputFile{input("index.html", "x")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	removeProjection(t, ctx, c, r)
-	b, err := json.Marshal(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b = append(b, bytes.Repeat([]byte(" "), maxMetadata+1024)...)
-	key := ReleasePrefix(r.Owner, r.Site, r.ID) + "manifest.json"
-	if _, err := store.Store.Put(ctx, key, bytes.NewReader(b), int64(len(b)), "application/json"); err != nil {
-		t.Fatal(err)
-	}
-	store.ignoreManifestSize = true
-	if _, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("oversized actual metadata accepted: %v", err)
-	}
-	if store.bytesRead > maxMetadata+1 {
-		t.Fatalf("legacy reader exceeded byte limit: %d", store.bytesRead)
-	}
-}
-
-func TestLegacyServingLoadsAndVerifiesEmbeddedPagesFile(t *testing.T) {
-	ctx := context.Background()
-	c, store := newProjectionCatalog()
-	r, err := c.Publish(ctx, "foo", "source", origin("old-pages"), projectFiles())
-	if err != nil {
-		t.Fatal(err)
-	}
-	removeProjection(t, ctx, c, r)
-	r.Pages = nil
-	key := ReleasePrefix(r.Owner, r.Site, r.ID) + "manifest.json"
-	if err := c.write(ctx, key, r); err != nil {
-		t.Fatal(err)
-	}
-	header, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID)
-	if err != nil || header.Pages == nil {
-		t.Fatalf("legacy pages.json was not loaded: %#v %v", header, err)
-	}
-	f, err := c.GetServingFile(ctx, header, "assets/app.abc.js")
-	if err != nil || !f.Immutable {
-		t.Fatalf("legacy immutable policy was not loaded: %#v %v", f, err)
-	}
-	if _, err := store.Put(ctx, FileKey(r, "pages.json"), strings.NewReader("{}"), 2, "application/json"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("legacy pages digest mismatch accepted: %v", err)
-	}
-	r.Owner = "foreign"
-	if err := c.write(ctx, key, r); err != nil {
+	header := servingRelease(r)
+	if err := store.Delete(ctx, ServingReleaseKey(header)); err != nil {
 		t.Fatal(err)
 	}
 	store.gets = nil
-	if _, err := c.GetServingRelease(ctx, "source", "foo", r.ID); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("foreign legacy header accepted: %v", err)
+	if _, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("release without descriptor became readable: %v", err)
 	}
-	for _, key := range store.gets {
-		if strings.Contains(key, "/files/") {
-			t.Fatalf("invalid envelope triggered an owned file read: %s", key)
-		}
+	if len(store.gets) != 1 || store.gets[0] != ServingReleaseKey(header) {
+		t.Fatalf("missing descriptor triggered an inventory or body read: %v", store.gets)
+	}
+}
+
+func TestServingProjectionRejectsOtherFileMetadataVersions(t *testing.T) {
+	ctx := context.Background()
+	c, store := newProjectionCatalog()
+	r, err := c.Publish(ctx, "foo", "source", origin("metadata-version"), projectFiles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []int{0, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			header := servingRelease(r)
+			header.FileMetadataVersion = version
+			encoded, err := json.Marshal(header)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeServingRelease(encoded, r.Owner, r.Site, r.ID); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("cached unsupported metadata version accepted: %v", err)
+			}
+			if err := c.write(ctx, ServingReleaseKey(header), header); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("unsupported metadata version accepted: %v", err)
+			}
+			store.gets = nil
+			if _, err := c.GetServingFile(ctx, header, "assets/app.abc.js"); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("unsupported file metadata version accepted: %v", err)
+			}
+			if len(store.gets) != 0 {
+				t.Fatalf("invalid descriptor triggered a metadata read: %v", store.gets)
+			}
+		})
+	}
+}
+
+func TestServingProjectionGCInterruptedBeforeDescriptorWithdrawal(t *testing.T) {
+	ctx := context.Background()
+	c, store := newProjectionCatalog()
+	r, err := c.Publish(ctx, "foo", "source", origin("gc-descriptor"), projectFiles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := siteFor(r)
+	s.Production = ""
+	if err := c.SaveSite(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	store.failDelete = "/serving.json"
+	store.deletes = nil
+	if err := c.DeleteRelease(ctx, s, r.ID); err == nil {
+		t.Fatal("expected interrupted descriptor deletion")
+	}
+	prefix := ReleasePrefix(r.Owner, r.Site, r.ID)
+	if len(store.deletes) != 2 || store.deletes[0] != prefix+"manifest.json" || store.deletes[1] != prefix+"serving.json" {
+		t.Fatalf("GC did not withdraw manifest first: %v", store.deletes)
+	}
+	if _, err := c.GetRelease(ctx, r.Owner, r.Site, r.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("interrupted GC left a reusable complete release: %v", err)
+	}
+	if _, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("orphaned descriptor became readable: %v", err)
+	}
+	store.failDelete = ""
+	r, err = c.Publish(ctx, r.Site, r.Owner, r.Origin, projectFiles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.GetServingFile(ctx, header, "assets/app.abc.js"); err != nil {
+		t.Fatalf("reselected release did not restore current metadata: %v", err)
 	}
 }

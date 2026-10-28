@@ -74,46 +74,38 @@ func safePath(p string, root bool) bool {
 }
 
 func (s *Sync) deploymentManifest(ctx context.Context, repo repository, sha string) (manifest, error) {
-	paths := []string{s.cfg.ManifestPath}
-	if s.cfg.ManifestPath == "page.yaml" {
-		// Immutable older commits still carry the previous deployment file.
-		// A present but invalid page.yaml never falls back to another file.
-		paths = append(paths, "manifest.json")
+	filename := s.cfg.ManifestPath
+	endpoint := repoEndpoint(repo.FullName) + "/contents/" + escapePath(filename) + "?ref=" + url.QueryEscape(sha)
+	resp, err := s.request(ctx, endpoint, "application/vnd.github.raw+json")
+	if err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) && ae.status == http.StatusNotFound {
+			return manifest{}, errNoManifest
+		}
+		return manifest{}, err
 	}
-	for _, filename := range paths {
-		endpoint := repoEndpoint(repo.FullName) + "/contents/" + escapePath(filename) + "?ref=" + url.QueryEscape(sha)
-		resp, err := s.request(ctx, endpoint, "application/vnd.github.raw+json")
-		if err != nil {
-			var ae *apiError
-			if errors.As(err, &ae) && ae.status == 404 {
-				continue
-			}
-			return manifest{}, err
-		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
-		resp.Body.Close()
-		if err != nil {
-			return manifest{}, err
-		}
-		if len(data) > 65536 {
-			return manifest{}, errors.New("deployment manifest exceeds 64 KiB")
-		}
-		var m manifest
-		decoder := yaml.NewDecoder(bytes.NewReader(data))
-		decoder.KnownFields(true)
-		if err := decoder.Decode(&m); err != nil {
-			return manifest{}, &manifestDecodeError{filename, err}
-		}
-		var extra any
-		if err := decoder.Decode(&extra); err != io.EOF {
-			return manifest{}, fmt.Errorf("%s must contain one YAML document", filename)
-		}
-		if m.SchemaVersion != 1 || !safePath(m.Publish.Directory, true) {
-			return manifest{}, errors.New("manifest needs schemaVersion 1 and a safe publish.directory")
-		}
-		return m, nil
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
+	resp.Body.Close()
+	if err != nil {
+		return manifest{}, err
 	}
-	return manifest{}, errNoManifest
+	if len(data) > 65536 {
+		return manifest{}, errors.New("deployment manifest exceeds 64 KiB")
+	}
+	var m manifest
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&m); err != nil {
+		return manifest{}, &manifestDecodeError{filename, err}
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return manifest{}, fmt.Errorf("%s must contain one YAML document", filename)
+	}
+	if m.SchemaVersion != 1 || !safePath(m.Publish.Directory, true) {
+		return manifest{}, errors.New("manifest needs schemaVersion 1 and a safe publish.directory")
+	}
+	return m, nil
 }
 
 func (s *Sync) publish(ctx context.Context, repo repository, site, sha string) (*deploy.Release, error) {
@@ -124,9 +116,6 @@ func (s *Sync) publish(ctx context.Context, repo repository, site, sha string) (
 	origin := deploy.Origin{Kind: "git", RepositoryID: strconv.FormatInt(repo.ID, 10), Repository: repo.FullName, Revision: sha, Directory: m.Publish.Directory}
 	id := deploy.ReleaseID(s.cfg.ID, site, origin)
 	if r, err := s.cat.GetRelease(ctx, s.cfg.ID, site, id); err == nil {
-		if err := s.cat.EnsureServingProjection(ctx, r); err != nil {
-			return nil, err
-		}
 		return r, nil
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return nil, err

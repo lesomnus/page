@@ -133,19 +133,3 @@ func TestBooleanPatternMatchingMatchesCaptureMatcher(t *testing.T) {
 		}
 	}
 }
-
-func TestMatchImmutableCompilesOnlyAssetPolicy(t *testing.T) {
-	c := &Config{SchemaVersion: 1, Assets: Assets{Immutable: []string{"/assets/*"}}}
-	for _, path := range []string{"assets/app.js", "/assets/nested/app.css"} {
-		if immutable, err := MatchImmutable(c, path); err != nil || !immutable {
-			t.Fatalf("%s: %v %v", path, immutable, err)
-		}
-	}
-	if immutable, err := MatchImmutable(c, "index.html"); err != nil || immutable {
-		t.Fatalf("unmatched file: %v %v", immutable, err)
-	}
-	c.Assets.Immutable = append(c.Assets.Immutable, "/bad/*/path")
-	if _, err := MatchImmutable(c, "assets/app.js"); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("malformed policy ignored after earlier match: %v", err)
-	}
-}

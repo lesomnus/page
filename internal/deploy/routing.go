@@ -34,10 +34,10 @@ func CompilePages(config *routes.Config, inventory map[string]File) (*routes.Eng
 	return e, nil
 }
 
-// loadPages also supports manifests created before pages.json was interpreted.
-// The original immutable file digest is verified before parsing legacy metadata.
-func (c *Catalog) loadPages(ctx context.Context, r *Release) error {
-	if f, ok := r.Files["pages.json"]; ok && r.Pages == nil {
+// parsePagesForPublication validates the uploaded routing file before either
+// the serving descriptor or completion manifest can make a release visible.
+func (c *Catalog) parsePagesForPublication(ctx context.Context, r *Release) error {
+	if f, ok := r.Files["pages.json"]; ok {
 		if f.Size > 65536 {
 			return fmt.Errorf("%w: pages.json exceeds 64 KiB", ErrInvalid)
 		}
