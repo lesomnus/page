@@ -24,18 +24,17 @@ import (
 func sha(n int) string { return fmt.Sprintf("%040x", n) }
 
 type fakeGitHub struct {
-	mu              sync.Mutex
-	head            string
-	branches        map[string]string
-	tags            map[string]string
-	parents         map[string][]string
-	manifests       map[string]string
-	legacyManifests map[string]string
-	archives        map[string][]byte
-	archiveReads    int
-	pageFailure     bool
-	repeatedPage    bool
-	branchFailure   bool
+	mu            sync.Mutex
+	head          string
+	branches      map[string]string
+	tags          map[string]string
+	parents       map[string][]string
+	manifests     map[string]string
+	archives      map[string][]byte
+	archiveReads  int
+	pageFailure   bool
+	repeatedPage  bool
+	branchFailure bool
 }
 
 func fixture(t *testing.T) (*fakeGitHub, *httptest.Server) {
@@ -105,13 +104,6 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		write(c)
 	case r.URL.Path == "/repos/acme/foo.app/contents/page.yaml":
 		manifest, ok := f.manifests[r.URL.Query().Get("ref")]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		io.WriteString(w, manifest)
-	case r.URL.Path == "/repos/acme/foo.app/contents/manifest.json":
-		manifest, ok := f.legacyManifests[r.URL.Query().Get("ref")]
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -497,7 +489,7 @@ func TestFailedScanOrPublicationPreservesAliases(t *testing.T) {
 	}
 }
 
-func TestMissingManifestAndBranchTagNames(t *testing.T) {
+func TestMissingManifestWithdrawsPreviewAndKeepsLastProduction(t *testing.T) {
 	f, api := fixture(t)
 	cat := deploy.New(storage.NewMemory())
 	cfg := config(api.URL)
@@ -521,8 +513,14 @@ func TestMissingManifestAndBranchTagNames(t *testing.T) {
 	f.mu.Unlock()
 	mustOnce(t, s)
 	after := getSite(t, cat)
-	if after.Production != site.Production || after.Aliases[deploy.AliasToken("branch", "refs/heads/release")].Release != b.Release {
-		t.Fatal("missing manifest removed a previous successful snapshot")
+	if after.Production != site.Production {
+		t.Fatal("missing production manifest removed the last successful production")
+	}
+	if _, exists := after.Aliases[deploy.AliasToken("branch", "refs/heads/release")]; exists {
+		t.Fatal("preview without its configured manifest retained an old snapshot")
+	}
+	if after.Aliases[deploy.AliasToken("tag", "refs/tags/release")].Release != tag.Release {
+		t.Fatal("manifest exclusion affected another valid preview")
 	}
 	// A newly discovered repository with no deployable production stays absent.
 	empty := deploy.New(storage.NewMemory())

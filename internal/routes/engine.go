@@ -419,33 +419,6 @@ func (e *Engine) Immutable(filename string) bool {
 	return false
 }
 
-// MatchImmutable checks a previously published asset policy without compiling
-// its unrelated routing rules. File type restrictions remain the publisher's
-// and serving file envelope's responsibility.
-func MatchImmutable(config *Config, filename string) (bool, error) {
-	if config == nil {
-		return false, nil
-	}
-	if len(config.Assets.Immutable) > MaxRules {
-		return false, invalid("too many rules")
-	}
-	if !strings.HasPrefix(filename, "/") {
-		filename = "/" + filename
-	}
-	if !safeAbsolute(filename) {
-		return false, nil
-	}
-	matched := false
-	for _, raw := range config.Assets.Immutable {
-		p, err := newPattern(raw)
-		if err != nil {
-			return false, err
-		}
-		matched = matchesPath(p, filename) || matched
-	}
-	return matched, nil
-}
-
 // Matching headers and excludes needs no captures or path segment slices.
 // Route captures are allocated only after a pattern has actually matched.
 func matchesPath(p pattern, requestPath string) bool {

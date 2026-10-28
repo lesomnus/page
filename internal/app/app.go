@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,11 +13,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/lesomnus/page/internal/api"
 	"github.com/lesomnus/page/internal/deploy"
 	"github.com/lesomnus/page/internal/githubsync"
+	"github.com/lesomnus/page/internal/metacache"
 	"github.com/lesomnus/page/internal/serving"
 	"github.com/lesomnus/page/internal/storage"
 	"github.com/lesomnus/payday/version"
@@ -33,6 +36,7 @@ type Config struct {
 	PreviewStyle     string              `yaml:"preview_style"`
 	PreviewAliasMode string              `yaml:"preview_alias_mode"`
 	RefreshInterval  time.Duration       `yaml:"refresh_interval"`
+	MetadataCache    metacache.Config    `yaml:"metadata_cache"`
 	WebhookListen    string              `yaml:"webhook_listen"`
 	WebhookSecret    string              `yaml:"webhook_secret"`
 	Storage          storage.S3Config    `yaml:"storage"`
@@ -40,7 +44,7 @@ type Config struct {
 }
 
 func Load(name string) (Config, error) {
-	c := Config{Listen: ":8080", APIListen: "127.0.0.1:50051", BaseDomain: "example.com", PreviewStyle: "flat", PreviewAliasMode: deploy.PreviewAliasQualified, RefreshInterval: 5 * time.Minute}
+	c := Config{Listen: ":8080", APIListen: "127.0.0.1:50051", BaseDomain: "example.com", PreviewStyle: "flat", PreviewAliasMode: deploy.PreviewAliasQualified, RefreshInterval: 5 * time.Minute, MetadataCache: metacache.Config{Directory: filepath.Join(os.TempDir(), "page-cache")}}
 	f, e := os.Open(name)
 	if e != nil {
 		return c, e
@@ -54,6 +58,10 @@ func Load(name string) (Config, error) {
 	var extra any
 	if e = d.Decode(&extra); e != io.EOF {
 		return c, errors.New("configuration must contain one YAML document")
+	}
+	c.MetadataCache, e = c.MetadataCache.Normalize()
+	if e != nil {
+		return c, fmt.Errorf("metadata_cache: %w", e)
 	}
 	c.PreviewAliasMode, e = deploy.PreviewAliasMode(c.PreviewAliasMode)
 	if e != nil {
@@ -224,7 +232,11 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 }
 
 func Serve(ctx context.Context, c Config, catalog *deploy.Catalog) error {
-	h, e := serving.New(catalog, serving.Config{BaseDomain: c.BaseDomain, PreviewStyle: c.PreviewStyle, PreviewAliasMode: c.PreviewAliasMode, RefreshInterval: c.RefreshInterval})
+	// Local cache keys must never cross an endpoint/bucket/prefix boundary.
+	// S3Config contains no credentials; only its fingerprint is persisted.
+	identity, _ := json.Marshal(c.Storage)
+	c.MetadataCache.Namespace = fmt.Sprintf("page-serving-v1-%x", sha256.Sum256(identity))
+	h, e := serving.New(catalog, serving.Config{BaseDomain: c.BaseDomain, PreviewStyle: c.PreviewStyle, PreviewAliasMode: c.PreviewAliasMode, RefreshInterval: c.RefreshInterval, MetadataCache: c.MetadataCache})
 	if e != nil {
 		return e
 	}

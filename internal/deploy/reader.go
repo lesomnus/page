@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -36,6 +37,31 @@ func (c *Catalog) GetSiteInfo(ctx context.Context, name string) (*Site, storage.
 		s.Retired = map[string]time.Time{}
 	}
 	return &s, info, nil
+}
+
+// DecodeSite validates a locally cached publication just as a Storage read
+// would. It never reads Storage or shares mutable state with the source writer.
+func DecodeSite(data []byte, name string) (*Site, error) {
+	if !ValidName(name) || len(data) > maxMetadata {
+		return nil, ErrInvalid
+	}
+	var site Site
+	if err := json.Unmarshal(data, &site); err != nil {
+		return nil, fmt.Errorf("%w: cached site: %v", ErrInvalid, err)
+	}
+	if err := validateSite(&site); err != nil {
+		return nil, err
+	}
+	if site.Name != name {
+		return nil, ErrInvalid
+	}
+	if site.Aliases == nil {
+		site.Aliases = map[string]Alias{}
+	}
+	if site.Retired == nil {
+		site.Retired = map[string]time.Time{}
+	}
+	return &site, nil
 }
 
 // ListSiteObjects reads the complete inventory, retaining object fingerprints

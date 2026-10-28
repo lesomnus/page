@@ -181,7 +181,11 @@ func (c *Catalog) GetRelease(ctx context.Context, owner, site, id string) (*Rele
 	if r.Owner != owner || r.Site != site || r.ID != id || !r.Complete {
 		return nil, ErrInvalid
 	}
-	if err := c.loadPages(ctx, &r); err != nil {
+	_, hasPages := r.Files["pages.json"]
+	if hasPages != (r.Pages != nil) {
+		return nil, fmt.Errorf("%w: persisted pages.json configuration missing or unexpected", ErrInvalid)
+	}
+	if _, err := releaseEngine(&r); err != nil {
 		return nil, err
 	}
 	return &r, nil
@@ -202,9 +206,6 @@ func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin
 	}
 	id := ReleaseID(owner, site, origin)
 	if r, err := c.GetRelease(ctx, owner, site, id); err == nil {
-		if err := c.ensureServingProjection(ctx, r); err != nil {
-			return nil, err
-		}
 		return r, nil
 	} else if !errorsIsNotFound(err) {
 		return nil, err
@@ -250,7 +251,7 @@ func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin
 		}
 		r.Files[f.Path] = File{Path: f.Path, Size: f.Size, ContentType: typ, SHA256: hex.EncodeToString(h.Sum(nil))}
 	}
-	if err := c.loadPages(ctx, r); err != nil {
+	if err := c.parsePagesForPublication(ctx, r); err != nil {
 		return nil, err
 	}
 	r.Complete = true
@@ -373,15 +374,15 @@ func (c *Catalog) DeleteRelease(ctx context.Context, s *Site, id string) error {
 	if err != nil {
 		return err
 	}
-	// Withdraw both serving metadata and completeness before deleting content.
-	// Otherwise interrupted GC could leave a readable release with missing files.
+	// Withdraw completeness before serving metadata or content. Otherwise an
+	// interrupted GC could leave a complete release with a missing projection.
 	// The upload marker is deleted last so interrupted deletion stays discoverable.
 	sort.Slice(objects, func(i, j int) bool {
 		priority := func(key string) int {
-			if key == prefix+"serving.json" {
+			if key == prefix+"manifest.json" {
 				return 0
 			}
-			if key == prefix+"manifest.json" {
+			if key == prefix+"serving.json" {
 				return 1
 			}
 			if key == prefix+"upload.json" {

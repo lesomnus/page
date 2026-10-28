@@ -23,9 +23,9 @@ func publishPages(t *testing.T, c *Catalog, rev, config string, files ...InputFi
 	return r
 }
 
-func TestRoutingValidationBeforeCompletionAndLegacyRead(t *testing.T) {
+func TestRoutingValidationBeforeCompletionAndPersistedConfigRead(t *testing.T) {
 	ctx := context.Background()
-	c := New(storage.NewMemory())
+	c, store := newProjectionCatalog()
 	old := publishPages(t, c, "old", "", input("index.html", "old"))
 	if e := c.SaveSite(ctx, siteFor(old)); e != nil {
 		t.Fatal(e)
@@ -42,19 +42,60 @@ func TestRoutingValidationBeforeCompletionAndLegacyRead(t *testing.T) {
 		t.Fatalf("publication changed: %v %v", s, e)
 	}
 	valid := publishPages(t, c, "valid", `{"schemaVersion":1,"routing":{"cleanUrls":true}}`, input("index.html", "ok"))
-	valid.Pages = nil // A manifest written before pages.json had server semantics.
+	store.gets = nil
+	read, e := c.GetRelease(ctx, "source", "foo", valid.ID)
+	if e != nil || read.Pages == nil || !read.Pages.Routing.CleanURLs {
+		t.Fatalf("persisted routing config not loaded: %v %v", read, e)
+	}
+	if len(store.gets) != 1 || store.gets[0] != ReleasePrefix(valid.Owner, valid.Site, valid.ID)+"manifest.json" {
+		t.Fatalf("release read fetched file bodies: %v", store.gets)
+	}
+	pages := valid.Pages
+	valid.Pages = nil
 	if e = c.write(ctx, ReleasePrefix(valid.Owner, valid.Site, valid.ID)+"manifest.json", valid); e != nil {
 		t.Fatal(e)
 	}
-	read, e := c.GetRelease(ctx, "source", "foo", valid.ID)
-	if e != nil || read.Pages == nil || !read.Pages.Routing.CleanURLs {
-		t.Fatalf("legacy config not loaded: %v %v", read, e)
+	store.gets = nil
+	if _, e = c.GetRelease(ctx, "source", "foo", valid.ID); !errors.Is(e, ErrInvalid) {
+		t.Fatalf("manifest missing persisted routing config accepted: %v", e)
 	}
-	if _, e = c.Store.Put(ctx, FileKey(valid, "pages.json"), strings.NewReader("tampered"), 8, "application/json"); e != nil {
+	if len(store.gets) != 1 {
+		t.Fatalf("missing persisted config triggered a file read: %v", store.gets)
+	}
+	valid.Pages = pages
+	delete(valid.Files, "pages.json")
+	if e = c.write(ctx, ReleasePrefix(valid.Owner, valid.Site, valid.ID)+"manifest.json", valid); e != nil {
 		t.Fatal(e)
 	}
 	if _, e = c.GetRelease(ctx, "source", "foo", valid.ID); !errors.Is(e, ErrInvalid) {
-		t.Fatalf("legacy digest unchecked: %v", e)
+		t.Fatalf("routing config without its inventory file accepted: %v", e)
+	}
+}
+
+type corruptPublicationPages struct{ storage.Store }
+
+func (s corruptPublicationPages) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
+	body, info, err := s.Store.Get(ctx, key)
+	if err == nil && strings.HasSuffix(key, "/files/pages.json") {
+		body.Close()
+		return io.NopCloser(strings.NewReader("tampered")), info, nil
+	}
+	return body, info, err
+}
+
+func TestPublicationRoutingFileDigestCheckedBeforeCompletion(t *testing.T) {
+	ctx := context.Background()
+	c := New(corruptPublicationPages{Store: storage.NewMemory()})
+	o := origin("corrupt-pages")
+	if _, err := c.Publish(ctx, "foo", "source", o, []InputFile{input("index.html", "ok"), input("pages.json", `{"schemaVersion":1}`)}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("corrupt uploaded routing metadata accepted: %v", err)
+	}
+	id := ReleaseID("source", "foo", o)
+	if _, err := c.GetRelease(ctx, "source", "foo", id); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("corrupt routing metadata completed publication: %v", err)
+	}
+	if _, err := c.GetServingRelease(ctx, "source", "foo", id); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("corrupt routing metadata became readable: %v", err)
 	}
 }
 

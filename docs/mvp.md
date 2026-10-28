@@ -91,9 +91,8 @@ publish:
 스키마 버전은 1이고 게시 디렉터리는 레포 내 상대 경로이며 `.`도 허용한다. 배포 파일과 게시 파일은
 같은 전체 SHA에서 읽는다. 알 수 없는 필드·중복 키·여러 YAML 문서·64 KiB 초과 파일은 거부한다.
 
-기본 경로에서 `page.yaml`이 404이면 과거 커밋의 preview를 유지하기 위해 이전 `manifest.json`을 읽는다.
-`page.yaml`이 존재하지만 잘못됐으면 이전 파일로 우회하지 않는다. `manifest_path`로 다른 경로를 지정하면
-그 파일만 읽는다. 새 배포 파일은 `page.yaml`을 사용한다.
+기본 배포 설정은 `page.yaml`만 읽는다. 없으면 해당 커밋은 배포 대상에서 제외한다.
+`manifest_path`로 다른 경로를 명시한 경우에는 그 파일만 읽으며 자동 fallback은 없다.
 빌드를 실행하지 않으며 게시 디렉터리의 symlink·특수 파일·경로 탈출을 거부한다.
 
 시작·정기 polling 때는 전체 저장소 목록을 탐색한다. 설정한 webhook은 알림에 지정된
@@ -122,9 +121,9 @@ Storage의 `manifest.json`은 서버가 작성하는 릴리스 메타데이터�
 사이트 객체에는 운영·preview 참조와 GC 대기 상태를 기록한다.
 `serving.json`에는 파일 목록 없이 릴리스 식별 정보와 라우팅 설정만 기록한다. 각 파일의
 크기·MIME·SHA-256·immutable 여부는 경로를 해시한 `metadata/` 객체로 따로 읽는다.
-본문과 이 메타데이터를 업로드한 뒤 완료 manifest를 기록하며, 서빙도 매번 manifest의
-존재를 확인한다. 이전 형식은 manifest를 스트리밍 해석해 파일 하나씩 읽고, 기존 완료
-릴리스를 sync가 재사용할 때 새 서빙 메타데이터를 보충한다.
+본문과 이 메타데이터를 업로드한 뒤 완료 manifest를 기록한다. 캐시가 없는 최초 조회는
+완료 manifest의 존재와 현재 descriptor 형식을 확인한다. `serving.json`과 파일별 메타데이터가
+없는 이전 Storage 형식은 지원하지 않는다.
 
 ## pages.json 라우팅
 
@@ -247,8 +246,8 @@ go run ./cmd/page remove foo
 
 ## preview와 보존
 
-branch/tag 별칭은 해당 ref의 최신 성공 배포를 가리킨다. 새 배포가 실패하면 이전
-성공 배포를 유지한다. commit 별칭은 전체 SHA에 고정되며 같은 snapshot은 공유한다.
+branch/tag 별칭은 해당 ref의 최신 성공 배포를 가리킨다. 설정이 있지만 새 배포가 실패하면
+이전 성공 배포를 유지한다. 설정 파일이 없는 커밋의 preview는 제외한다. commit 별칭은 전체 SHA에 고정되며 같은 snapshot은 공유한다.
 기본 `preview_alias_mode: qualified`는 `b-`, `t-`, `c-` 종류 접두사, 안전한 slug와
 해시로 별칭을 구성한다. 원래 ref와 전체 SHA는 metadata에 남는다. 다음 명령은 Storage만 읽어 사이트·운영 URL과
 preview별 ref·SHA·정확한 URL을 JSON으로 출력한다. HTTP/gRPC 서버가 실행 중일
@@ -280,8 +279,8 @@ flat URL은 `<별칭>--foo.example.com`, nested URL은 `<별칭>.foo.example.com
 tag끼리 모호한 경우 branch로 대신 제공하지 않는다. DNS 길이 제한을 넘거나 다른
 사이트의 운영 주소·기존 별칭 주소와 충돌해도 짧은 주소를 제공하지 않는다.
 `status`는 선택한 짧은 URL과 commit URL을 `previews`에 출력하고, 짧은 주소를 쓰지
-못한 ref는 이유와 기존 URL을 `previewProblems`에 출력한다. 기존 접두사·해시가
-있는 branch/tag URL은 계속 동작하며 commit URL은 바뀌지 않는다. 이 설정은 URL
+못한 ref는 이유와 qualified URL을 `previewProblems`에 출력한다. 종류 접두사·해시가
+있는 qualified branch/tag 주소와 commit 주소도 제공한다. 이 설정은 URL
 선택만 바꾸며 ref 보존 정책과 Storage metadata 형식은 바꾸지 않는다.
 
 현재 운영 배포, 선택 branch/tag의 최신 성공 배포와 최근 N개 선택 커밋의 배포를
@@ -330,21 +329,46 @@ HTML·XHTML·pages.json은 확장자와 MIME을 검사해 제외한다. 운영 �
 프로세스에서 추가한 사이트·preview 호스트를 발견하는 복구 경로다. 이 조회는 릴리스를
 읽거나 라우팅 엔진을 컴파일하지 않는다.
 
-매 HTTP 요청은 최신 `site.json`을 읽어 운영 또는 preview 릴리스를 선택한다.
-preview는 같은 호스트를 예약할 수 있는 사이트명도 Storage에서 확인해 이름 충돌 규칙을 유지한다.
-`serving.json`의 라우팅을 요청 안에서만 컴파일하고, 경로 후보의 파일 메타데이터만 읽는다.
-선택된 본문의 크기를 확인한 뒤 Storage에서 스트리밍하며 SHA-256 ETag를 유지한다.
-이전 운영 자산도 만료되지 않은 릴리스를 하나씩 확인하고 immutable 파일만 제공한다.
-Site 본문·릴리스·전체 파일 목록·컴파일한 엔진은 요청 사이에 캐시하지 않는다.
-파일 수나 보존 릴리스 수가 서빙 상주 메모리를 늘리지 않으며, 호스트 수와 동시 요청의
-라우팅 설정·Storage I/O 버퍼가 메모리에 영향을 준다. sync와 읽기 전용 API는 게시 검증·GC·
-조회 작업 중 전체 manifest를 일시적으로 읽을 수 있다.
+HTTP 요청은 작은 사이트·릴리스 메타데이터와 컴파일한 라우팅을 재사용한다. 파일별
+메타데이터와 본문, 전체 파일 목록은 캐시하지 않는다. 기본 설정은 다음과 같다.
 
-Storage 조회와 요청별 라우팅 컴파일이 늘어나는 대신 상주 메모리를 줄이는 방식이다.
-메타데이터 조회가 실패하면 과거 캐시로 응답하지 않고 503을 반환한다. 삭제·비활성화·기존
-호스트의 배포 전환은 다음 HTTP 요청에서 확인한다. 새 호스트는 인덱스 갱신 후 제공한다.
-인덱스 재조회가 실패하면 이전 호스트 인덱스를 유지하고 1·2·4초 간격으로 최대 세 번
-재시도한 뒤 새 알림이나 정기 재확인을 기다린다. 이때도 각 요청은 Storage를 읽는다.
+```yaml
+metadata_cache:
+  ttl: 5s
+  memory_bytes: 4194304
+  disk_bytes: 67108864
+  directory: /tmp/page-cache
+```
+
+`ttl`은 mutable `site.json`의 freshness 확인 주기다. 만료되어도 데이터를 삭제하지 않는다.
+다음 요청에서 Storage HEAD의 ETag가 같으면 기존 데이터를 재사용하고, 달라졌거나 ETag가
+없으면 GET으로 갱신한다. 같은 키의 동시 최초 조회·재확인은 한 번으로 합친다. 같은
+프로세스의 게시가 성공하면 mutable 캐시를 즉시 무효화하므로 배포 전환·삭제·비활성화는
+알림 처리를 기다리지 않고 새 요청에서 확인한다. 다른 프로세스의 변경은 freshness 주기
+안에 발견한다. preview는 같은 호스트를 예약할 수 있는 사이트들도 같은 방식으로 확인한다.
+
+완료된 `serving.json`과 해석한 라우팅은 소유자·사이트·릴리스 ID·사이트 게시 시각으로
+재사용한다. 같은 Git 커밋이 GC 후 재게시돼도 새 descriptor와 파일 메타데이터를 함께 읽는다.
+파일 경로 후보만 Storage에서 조회하고, 선택된 본문을 스트리밍하며 SHA-256 ETag를 유지한다.
+이전 운영 자산의 lease 만료는 캐시와 무관하게 요청마다 검사한다.
+
+메모리 캐시는 LRU이며 기본 4 MiB의 계산된 비용 상한을 둔다. 비용에는 encoded JSON과
+해석한 객체의 보수적인 추정치가 포함되며, 실제 Go heap·프로세스 RSS 상한을 뜻하지 않는다.
+메모리에서 밀려난 데이터는 로컬 디스크의 2차 캐시에서 다시 읽는다. 디스크에서 읽은 mutable
+사이트는 Storage에서 재확인하고, 불변 descriptor는 재해석해 메모리로 올린다. 디스크 캐시는
+저장소 namespace별 기본 64 MiB이며 용량 압박에 따라 오래된 항목을 제거한다. 앱 파일 수·보존 릴리스 수 전체를
+메모리에 올리지 않고 활성 메타데이터만 상한 안에서 보관한다.
+
+디스크 파일은 임시 파일과 rename으로 교체하고 저장소 namespace·키·checksum을 검사한다.
+손상·누락·디스크 쓰기 실패는 origin 조회로 복구하며, TTL을 새로 붙여 오래된 Site를 최신으로
+취급하지 않는다. origin 재확인 실패는 503을 반환한다. `directory: ""`이면 디스크 캐시를 끈다.
+컨테이너에서는 cache 디렉터리를 쓰기 가능한 디스크 기반 `emptyDir`로 마운트할 수 있다.
+재시작 시 캐시가 사라져도 Storage에서 복구하므로 PVC가 필요하지 않다.
+
+5분 인덱스 재조회는 릴리스 전체를 읽거나 라우팅을 미리 컴파일하지 않는다. 실패하면 이전
+호스트 인덱스를 유지하고 1·2·4초 간격으로 최대 세 번 재시도한다. sync와 읽기 전용 API는
+이 서빙 캐시를 우회하며, 게시 검증·GC·조회 작업 중 전체 manifest를 일시적으로 읽을 수 있다.
+`gc_grace`는 Site freshness와 진행 중 다운로드 시간을 충분히 넘도록 설정한다.
 
 GitHub 이벤트로 소유 sync를 깨우려면 `run` 또는 지속 실행하는 `sync`에 별도 listener를 켠다.
 
@@ -379,8 +403,8 @@ GitHub 이벤트를 놓치거나 너무 커서 거부했을 때는 소스의 `po
 실행하지 않는다. 별도 CLI 프로세스가 쓴
 `control.json`은 소유 sync의 다음 polling에서 적용한다. `sync`와 `serve`를 별도 프로세스로
 운영하면 게시 알림도 공유되지 않으므로 새 사이트·preview 호스트는 다음
-`refresh_interval`에 발견한다. 이미 알고 있는 호스트의 배포 전환·삭제·비활성화는 요청마다
-Storage에서 확인한다. 프로세스 사이 호스트 추가 알림 전달은 별도 연결이 필요하다.
+`refresh_interval`에 발견한다. 이미 알고 있는 호스트의 배포 전환·삭제·비활성화는 짧은
+freshness 주기에 따라 확인한다. 프로세스 사이 호스트 추가 알림 전달은 별도 연결이 필요하다.
 
 외부 proxy는 webhook의 정확한 경로만 listener로 전달한다. 정적 사이트·gRPC 관리 경로는
 이 webhook 경로에 포함하지 않는다. `gc_grace`는 알림을 놓쳤을 때의 서빙 재확인 주기와

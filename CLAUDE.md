@@ -15,16 +15,26 @@ of GitHub and of the SQL scaffold. See README.md and docs/mvp.md.
   Publication, local route inspection and HTTP serving share this contract.
 - `internal/githubsync`: discovery, fixed-SHA publication, Git ref selection,
   preview aliases, retention and GC. Policies belong to the source sync.
-- `internal/serving`: retains only hostname ownership and reads Site, compact
-  release routing and candidate file metadata from Storage on every request.
-  Never add cross-request Site/release/inventory/compiled-engine caches. Bodies
-  stream from Storage. It never downloads from a source or decides retention.
+- `internal/metacache`: bounded read-only metadata L1/L2 with singleflight,
+  mutable freshness revalidation and atomic disposable disk records. Freshness
+  expiry does not delete entries. Keep source/writer reads outside this cache.
+- `internal/serving`: hostname ownership plus bounded Site/compact-release/route
+  metadata caches. Never retain complete file inventories or response bodies.
+  Publication invalidates mutable metadata; leases expire on every request.
+  It never downloads from a source or makes retention decisions.
 - `internal/api`: directly implements generated Site/Deployment Get/List over
   the catalog. No SQL Sink, driver binding or generated mutation stack.
 - `internal/app`, `cmd/page`: serving/sync, local route inspection, deployment
   control, status/config/version commands.
 - `cmd/scaffold`, `cli`, `cmd/*.go`, `ts/src`: retained upstream SQL/React
   example; use examples/scaffold.yaml. The product does not import its wiring.
+
+## Compatibility before v1.0.0
+
+Before v1.0.0, support the current resource and storage formats. Do not add
+fallback readers, migrations or API branches solely to preserve older formats.
+Update examples, fixtures and deployment configuration with contract changes.
+Check active production metadata when deploying a format change.
 
 ## Generate and verify
 
@@ -71,7 +81,7 @@ request. Preserve protected URL content across routing changes and rollback.
 Leases protect GC; publication history alone does not.
 
 Retire public references before GC. Check ownership and current references,
-remove the serving projection and then completion manifest before deleting
+remove the completion manifest and then serving projection before deleting
 content/sidecars, and keep the upload
 marker until the end so interrupted GC is recoverable. A policy reselecting
 an interrupted deletion must reupload a complete snapshot.

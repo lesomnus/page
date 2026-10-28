@@ -3,6 +3,7 @@ package deploy
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type changeKind uint8
@@ -15,9 +16,14 @@ const (
 // changeHub supplies process-local wakeups. Storage remains authoritative;
 // listeners reconcile periodically to discover writes from other processes.
 type changeHub struct {
-	mu       sync.Mutex
-	watchers map[changeKind]map[chan struct{}]struct{}
+	mu                  sync.Mutex
+	watchers            map[changeKind]map[chan struct{}]struct{}
+	publicationRevision atomic.Uint64
 }
+
+// PublicationRevision advances synchronously after each successful local Site
+// write. HTTP readers can invalidate metadata without waiting for an async wake.
+func (c *Catalog) PublicationRevision() uint64 { return c.changes.publicationRevision.Load() }
 
 // WatchPublications signals successful site.json writes through this Catalog.
 // Signals coalesce: each listener must read current state, not count messages.
@@ -62,6 +68,7 @@ func (c *Catalog) notifyWrite(key string) {
 	switch parts[2] {
 	case "site.json":
 		kind = publicationChanged
+		c.changes.publicationRevision.Add(1)
 	case "control.json":
 		kind = controlChanged
 	default:

@@ -10,20 +10,17 @@ import (
 	"io"
 	"mime"
 	"path"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/lesomnus/page/internal/routes"
-	"github.com/lesomnus/page/internal/storage"
 )
 
 const (
 	fileMetadataVersion       = 1
 	maxServingReleaseMetadata = 128 << 10
 	maxServingFileMetadata    = 16 << 10
-	maxLegacyPages            = 64 << 10
 )
 
 // ServingRelease contains only release-scoped routing and identity. File
@@ -78,7 +75,7 @@ func validateServingRelease(r *ServingRelease, owner, site, id string) error {
 	if err := validateRelease(&header); err != nil {
 		return err
 	}
-	if !r.Complete || r.Owner != owner || r.Site != site || r.ID != id || (r.FileMetadataVersion != 0 && r.FileMetadataVersion != fileMetadataVersion) {
+	if !r.Complete || r.Owner != owner || r.Site != site || r.ID != id || r.FileMetadataVersion != fileMetadataVersion {
 		return fmt.Errorf("%w: serving release identity or schema", ErrInvalid)
 	}
 	return nil
@@ -152,7 +149,6 @@ func (c *Catalog) writeBounded(ctx context.Context, key string, limit int, v any
 
 // GetServingRelease reads the small serving projection and checks the original
 // completion boundary. An orphaned projection never makes an upload visible.
-// Old releases are streamed without materializing their Files map.
 func (c *Catalog) GetServingRelease(ctx context.Context, owner, site, id string) (*ServingRelease, error) {
 	if !ValidName(owner) || !ValidName(site) || !ValidID(id) {
 		return nil, ErrInvalid
@@ -166,11 +162,6 @@ func (c *Catalog) GetServingRelease(ctx context.Context, owner, site, id string)
 	}
 	r := &ServingRelease{}
 	err = c.readBounded(ctx, ReleasePrefix(owner, site, id)+"serving.json", maxServingReleaseMetadata, r)
-	if errorsIsNotFound(err) {
-		r, _, err = c.readLegacyServing(ctx, owner, site, id, "")
-	} else if err == nil && r.FileMetadataVersion != fileMetadataVersion {
-		err = fmt.Errorf("%w: serving file metadata version", ErrInvalid)
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -180,9 +171,24 @@ func (c *Catalog) GetServingRelease(ctx context.Context, owner, site, id string)
 	return r, nil
 }
 
-// GetServingFile does a point read for new releases. A missing sidecar is a
-// missing file, not a reason to load the writer's inventory. Legacy releases
-// stream just one file record out of their bounded manifest instead.
+// DecodeServingRelease validates a compact cached descriptor without loading
+// its file inventory. Request routing performs its own structural validation.
+func DecodeServingRelease(data []byte, owner, site, id string) (*ServingRelease, error) {
+	if len(data) > maxServingReleaseMetadata {
+		return nil, ErrInvalid
+	}
+	var release ServingRelease
+	if err := json.Unmarshal(data, &release); err != nil {
+		return nil, fmt.Errorf("%w: cached serving release: %v", ErrInvalid, err)
+	}
+	if err := validateServingRelease(&release, owner, site, id); err != nil {
+		return nil, err
+	}
+	return &release, nil
+}
+
+// GetServingFile reads one required file record without loading the writer's
+// inventory. Missing sidecar metadata means the file is not published.
 func (c *Catalog) GetServingFile(ctx context.Context, r *ServingRelease, p string) (*ServingFile, error) {
 	if r == nil || !ValidName(r.Owner) || !ValidName(r.Site) || !ValidID(r.ID) || !validPath(p) {
 		return nil, ErrInvalid
@@ -191,70 +197,13 @@ func (c *Catalog) GetServingFile(ctx context.Context, r *ServingRelease, p strin
 		return nil, err
 	}
 	var f ServingFile
-	switch r.FileMetadataVersion {
-	case fileMetadataVersion:
-		if err := c.readBounded(ctx, ServingFileKey(r, p), maxServingFileMetadata, &f); err != nil {
-			return nil, err
-		}
-	case 0:
-		header, file, err := c.readLegacyServing(ctx, r.Owner, r.Site, r.ID, p)
-		if err != nil {
-			return nil, err
-		}
-		if header.Origin != r.Origin || !header.CreatedAt.Equal(r.CreatedAt) || !reflect.DeepEqual(header.Pages, r.Pages) {
-			return nil, fmt.Errorf("%w: legacy serving release changed", ErrInvalid)
-		}
-		if file == nil {
-			return nil, storage.ErrNotFound
-		}
-		immutable, err := routes.MatchImmutable(r.Pages, p)
-		if err != nil {
-			return nil, fmt.Errorf("%w: pages.json: %v", ErrInvalid, err)
-		}
-		f = ServingFile{SchemaVersion: SchemaVersion, Owner: r.Owner, Site: r.Site, ReleaseID: r.ID, RepositoryID: r.Origin.RepositoryID, CreatedAt: r.CreatedAt, File: *file, Immutable: immutable && immutableFileAllowed(*file)}
-	default:
-		return nil, fmt.Errorf("%w: serving file metadata version", ErrInvalid)
+	if err := c.readBounded(ctx, ServingFileKey(r, p), maxServingFileMetadata, &f); err != nil {
+		return nil, err
 	}
 	if err := validateServingFile(r, p, &f); err != nil {
 		return nil, err
 	}
 	return &f, nil
-}
-
-// EnsureServingProjection upgrades an already completed release in its owning
-// source's writer pass. Readers use the bounded legacy fallback and never write.
-// Like Publish, this requires a single active writer for the source/site.
-func (c *Catalog) EnsureServingProjection(ctx context.Context, r *Release) error {
-	if r == nil {
-		return ErrInvalid
-	}
-	if err := validateRelease(r); err != nil {
-		return err
-	}
-	if !r.Complete {
-		return fmt.Errorf("%w: incomplete release", ErrInvalid)
-	}
-	if err := c.loadPages(ctx, r); err != nil {
-		return err
-	}
-	return c.ensureServingProjection(ctx, r)
-}
-
-func (c *Catalog) ensureServingProjection(ctx context.Context, r *Release) error {
-	expected := servingRelease(r)
-	var existing ServingRelease
-	if err := c.readBounded(ctx, ServingReleaseKey(expected), maxServingReleaseMetadata, &existing); errorsIsNotFound(err) {
-		return c.writeServingProjection(ctx, r)
-	} else if err != nil {
-		return err
-	}
-	if err := validateServingRelease(&existing, r.Owner, r.Site, r.ID); err != nil {
-		return err
-	}
-	if !reflect.DeepEqual(&existing, expected) {
-		return fmt.Errorf("%w: serving projection disagrees with manifest", ErrInvalid)
-	}
-	return nil
 }
 
 func (c *Catalog) writeServingProjection(ctx context.Context, r *Release) error {
@@ -278,197 +227,4 @@ func (c *Catalog) writeServingProjection(ctx context.Context, r *Release) error 
 		}
 	}
 	return c.writeBounded(ctx, ServingReleaseKey(header), maxServingReleaseMetadata, header)
-}
-
-// readLegacyServing decodes one file record at a time. The decoder's working
-// buffer follows the largest individual value, not the number of release files.
-// Only the requested file and the old pages.json record survive the scan.
-func (c *Catalog) readLegacyServing(ctx context.Context, owner, site, id, requested string) (*ServingRelease, *File, error) {
-	key := ReleasePrefix(owner, site, id) + "manifest.json"
-	body, info, err := c.Store.Get(ctx, key)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer body.Close()
-	if info.Size < 0 || info.Size > maxMetadata {
-		return nil, nil, fmt.Errorf("%w: metadata too large", ErrInvalid)
-	}
-	limited := &io.LimitedReader{R: body, N: maxMetadata + 1}
-	dec := json.NewDecoder(limited)
-	dec.UseNumber()
-	r := &ServingRelease{}
-	var found, pagesFile *File
-	count := 0
-	parse := func() error {
-		token, err := dec.Token()
-		if err != nil || token != json.Delim('{') {
-			return fmt.Errorf("manifest must be an object")
-		}
-		seen := map[string]bool{}
-		for dec.More() {
-			token, err := dec.Token()
-			if err != nil {
-				return err
-			}
-			name, ok := token.(string)
-			if !ok {
-				return fmt.Errorf("invalid manifest field")
-			}
-			var target any
-			switch name {
-			case "schemaVersion":
-				target = &r.SchemaVersion
-			case "id":
-				target = &r.ID
-			case "site":
-				target = &r.Site
-			case "owner":
-				target = &r.Owner
-			case "origin":
-				target = &r.Origin
-			case "createdAt":
-				target = &r.CreatedAt
-			case "complete":
-				target = &r.Complete
-			case "pages":
-				target = &r.Pages
-			case "files":
-				if seen[name] {
-					return fmt.Errorf("duplicate manifest field %q", name)
-				}
-				seen[name] = true
-				token, err := dec.Token()
-				if err != nil || token != json.Delim('{') {
-					return fmt.Errorf("files must be an object")
-				}
-				for dec.More() {
-					token, err := dec.Token()
-					if err != nil {
-						return err
-					}
-					p, ok := token.(string)
-					if !ok {
-						return fmt.Errorf("invalid file path")
-					}
-					var f File
-					if err := dec.Decode(&f); err != nil {
-						return err
-					}
-					if err := validateFile(p, f); err != nil {
-						return err
-					}
-					count++
-					if p == requested {
-						copy := f
-						found = &copy
-					}
-					if p == "pages.json" {
-						copy := f
-						pagesFile = &copy
-					}
-				}
-				if _, err := dec.Token(); err != nil {
-					return err
-				}
-				continue
-			default:
-				if err := skipJSONValue(dec); err != nil {
-					return err
-				}
-				continue
-			}
-			if seen[name] {
-				return fmt.Errorf("duplicate manifest field %q", name)
-			}
-			seen[name] = true
-			if err := dec.Decode(target); err != nil {
-				return err
-			}
-		}
-		if _, err := dec.Token(); err != nil {
-			return err
-		}
-		if _, err := dec.Token(); err != io.EOF {
-			return fmt.Errorf("trailing manifest data")
-		}
-		if limited.N == 0 {
-			return fmt.Errorf("metadata too large")
-		}
-		return nil
-	}
-	if err := parse(); err != nil {
-		return nil, nil, fmt.Errorf("%w: %s: %v", ErrInvalid, key, err)
-	}
-	if count == 0 {
-		return nil, nil, fmt.Errorf("%w: empty release", ErrInvalid)
-	}
-	// Validate the envelope before using its identity to fetch legacy pages.json.
-	if err := validateServingRelease(r, owner, site, id); err != nil {
-		return nil, nil, err
-	}
-	if r.Pages == nil && pagesFile != nil {
-		if err := c.loadLegacyServingPages(ctx, r, *pagesFile); err != nil {
-			return nil, nil, err
-		}
-	}
-	if err := validateServingRelease(r, owner, site, id); err != nil {
-		return nil, nil, err
-	}
-	return r, found, nil
-}
-
-func (c *Catalog) loadLegacyServingPages(ctx context.Context, r *ServingRelease, f File) error {
-	if f.Size > maxLegacyPages {
-		return fmt.Errorf("%w: pages.json exceeds 64 KiB", ErrInvalid)
-	}
-	body, info, err := c.Store.Get(ctx, ServingObjectKey(r, "pages.json"))
-	if err != nil {
-		return err
-	}
-	defer body.Close()
-	if info.Size < 0 || info.Size > maxLegacyPages {
-		return fmt.Errorf("%w: pages.json exceeds 64 KiB", ErrInvalid)
-	}
-	b, err := io.ReadAll(io.LimitReader(body, maxLegacyPages+1))
-	if err != nil {
-		return err
-	}
-	h := sha256.Sum256(b)
-	if int64(len(b)) != f.Size || hex.EncodeToString(h[:]) != f.SHA256 {
-		return fmt.Errorf("%w: pages.json digest mismatch", ErrInvalid)
-	}
-	r.Pages, err = routes.Parse(b)
-	if err != nil {
-		return fmt.Errorf("%w: pages.json: %v", ErrInvalid, err)
-	}
-	return nil
-}
-
-// skipJSONValue consumes an unknown value without decoding nested inventories
-// into interface maps or slices. json.Decoder enforces valid nesting itself.
-func skipJSONValue(dec *json.Decoder) error {
-	token, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	delim, ok := token.(json.Delim)
-	if !ok || (delim != '{' && delim != '[') {
-		return nil
-	}
-	depth := 1
-	for depth > 0 {
-		token, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		if delim, ok := token.(json.Delim); ok {
-			switch delim {
-			case '{', '[':
-				depth++
-			case '}', ']':
-				depth--
-			}
-		}
-	}
-	return nil
 }

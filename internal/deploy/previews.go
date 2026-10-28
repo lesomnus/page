@@ -25,11 +25,11 @@ type PreviewRoute struct {
 // PreviewProblem explains why an alias has no short URL. Its qualified URL is
 // still served, including a branch shadowed by a tag at the short hostname.
 type PreviewProblem struct {
-	Site      string `json:"site"`
-	Kind      string `json:"kind"`
-	Ref       string `json:"ref"`
-	LegacyURL string `json:"qualifiedURL"`
-	Problem   string `json:"problem"`
+	Site         string `json:"site"`
+	Kind         string `json:"kind"`
+	Ref          string `json:"ref"`
+	QualifiedURL string `json:"qualifiedURL"`
+	Problem      string `json:"problem"`
 }
 
 type PreviewPlan struct {
@@ -168,12 +168,12 @@ func PlanPreviews(sites []*Site, baseDomain, style, mode string) (PreviewPlan, e
 				why = "short hostname conflicts with a production or qualified preview hostname"
 			}
 			for _, c := range candidates {
-				legacy := c.route
-				legacy.Host = Host(baseDomain, style, c.route.Site, c.route.Token)
+				qualified := c.route
+				qualified.Host = Host(baseDomain, style, c.route.Site, c.route.Token)
 				if why != "" {
-					problem(legacy, why)
+					problem(qualified, why)
 				} else if c.rank != rank {
-					problem(legacy, "a published tag takes precedence at the short hostname")
+					problem(qualified, "a published tag takes precedence at the short hostname")
 				}
 			}
 			if why != "" {
