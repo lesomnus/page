@@ -102,11 +102,8 @@ func validateRelease(r *Release) error {
 		return fmt.Errorf("%w: release identity or schema", ErrInvalid)
 	}
 	for p, f := range r.Files {
-		if !validPath(p) || f.Path != p || f.Size < 0 || len(f.SHA256) != 64 || f.ContentType == "" {
-			return fmt.Errorf("%w: release file %q", ErrInvalid, p)
-		}
-		if _, e := hex.DecodeString(f.SHA256); e != nil {
-			return fmt.Errorf("%w: file digest", ErrInvalid)
+		if err := validateFile(p, f); err != nil {
+			return err
 		}
 	}
 	if r.Complete && len(r.Files) == 0 {
@@ -190,8 +187,8 @@ func (c *Catalog) GetRelease(ctx context.Context, owner, site, id string) (*Rele
 	return &r, nil
 }
 
-// Publish writes an owned upload marker, all file objects, and finally the
-// immutable manifest. It does not move any public reference.
+// Publish writes an owned upload marker, all file objects and serving metadata,
+// and finally the immutable manifest. It does not move any public reference.
 func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin, files []InputFile) (*Release, error) {
 	if !ValidName(site) || !ValidName(owner) || origin.Kind == "" || origin.RepositoryID == "" || origin.Revision == "" || len(files) == 0 {
 		return nil, ErrInvalid
@@ -205,6 +202,9 @@ func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin
 	}
 	id := ReleaseID(owner, site, origin)
 	if r, err := c.GetRelease(ctx, owner, site, id); err == nil {
+		if err := c.ensureServingProjection(ctx, r); err != nil {
+			return nil, err
+		}
 		return r, nil
 	} else if !errorsIsNotFound(err) {
 		return nil, err
@@ -254,6 +254,11 @@ func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin
 		return nil, err
 	}
 	r.Complete = true
+	// Always rebuild this projection when the completion manifest was absent.
+	// An interrupted upload or GC may have left older projection objects behind.
+	if err := c.writeServingProjection(ctx, r); err != nil {
+		return nil, err
+	}
 	if err := c.write(ctx, ReleasePrefix(owner, site, id)+"manifest.json", r); err != nil {
 		return nil, err
 	}
@@ -368,18 +373,21 @@ func (c *Catalog) DeleteRelease(ctx context.Context, s *Site, id string) error {
 	if err != nil {
 		return err
 	}
-	// Withdraw completeness before deleting content. Otherwise an interrupted GC
-	// could leave a valid manifest with missing files that Publish would reuse.
+	// Withdraw both serving metadata and completeness before deleting content.
+	// Otherwise interrupted GC could leave a readable release with missing files.
 	// The upload marker is deleted last so interrupted deletion stays discoverable.
 	sort.Slice(objects, func(i, j int) bool {
 		priority := func(key string) int {
-			if key == prefix+"manifest.json" {
+			if key == prefix+"serving.json" {
 				return 0
 			}
-			if key == prefix+"upload.json" {
-				return 2
+			if key == prefix+"manifest.json" {
+				return 1
 			}
-			return 1
+			if key == prefix+"upload.json" {
+				return 3
+			}
+			return 2
 		}
 		pi, pj := priority(objects[i].Key), priority(objects[j].Key)
 		if pi != pj {

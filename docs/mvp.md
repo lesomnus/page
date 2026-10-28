@@ -110,6 +110,8 @@ sites/foo/control.json
 sources/github-acme/sites/foo/releases/<release-id>/
   upload.json
   manifest.json
+  serving.json
+  metadata/<sha256-of-file-path>.json
   files/index.html
   files/assets/app.js
 ```
@@ -118,6 +120,11 @@ sources/github-acme/sites/foo/releases/<release-id>/
 Storage의 `manifest.json`은 서버가 작성하는 릴리스 메타데이터이며 앱의 `page.yaml`과 별개다.
 내부 release ID와 Git SHA는 다른 식별자다. 파일 metadata에는 MIME·크기·SHA-256을,
 사이트 객체에는 운영·preview 참조와 GC 대기 상태를 기록한다.
+`serving.json`에는 파일 목록 없이 릴리스 식별 정보와 라우팅 설정만 기록한다. 각 파일의
+크기·MIME·SHA-256·immutable 여부는 경로를 해시한 `metadata/` 객체로 따로 읽는다.
+본문과 이 메타데이터를 업로드한 뒤 완료 manifest를 기록하며, 서빙도 매번 manifest의
+존재를 확인한다. 이전 형식은 manifest를 스트리밍 해석해 파일 하나씩 읽고, 기존 완료
+릴리스를 sync가 재사용할 때 새 서빙 메타데이터를 보충한다.
 
 ## pages.json 라우팅
 
@@ -317,20 +324,27 @@ HTML·XHTML·pages.json은 확장자와 MIME을 검사해 제외한다. 운영 �
 
 ## 변경 알림과 재확인
 
-`refresh_interval`의 기본값은 5분이다. 서빙 프로세스는 시작 시 즉시 전체 게시 상태를 읽고,
-같은 프로세스에서 `site.json` 저장이 성공하면 알림으로 다시 확인한다. 5분 주기 조회는
-알림 유실이나 다른 프로세스의 게시를 발견하는 복구 경로다.
+`refresh_interval`의 기본값은 5분이다. 서빙 프로세스는 시작 시 사이트 목록을 읽어
+호스트·사이트·소유자·저장소 ID의 작은 인덱스를 만든다. 같은 프로세스에서 `site.json`
+저장이 성공하면 알림으로 이를 다시 확인한다. 5분 주기 조회는 알림 유실이나 다른
+프로세스에서 추가한 사이트·preview 호스트를 발견하는 복구 경로다. 이 조회는 릴리스를
+읽거나 라우팅 엔진을 컴파일하지 않는다.
 
-불변 release manifest와 컴파일한 라우팅 엔진은 `(owner, site, id)`로 캐시한다.
-`site.json`은 목록의 ETag가 바뀐 것만 다시 읽고 GET 본문과 해당 응답의 ETag를 함께 보관한다.
-ETag가 없는 Storage에서는 GET으로 확인한다. 객체가 변경되지 않은 refresh의 Storage 요청은
-목록 페이지 수만큼의 LIST뿐이다. sync는 ref가 같아도 게시 점검 시각을 저장할 수 있으므로
-그때는 해당 `site.json`을 다시 읽는다.
+매 HTTP 요청은 최신 `site.json`을 읽어 운영 또는 preview 릴리스를 선택한다.
+preview는 같은 호스트를 예약할 수 있는 사이트명도 Storage에서 확인해 이름 충돌 규칙을 유지한다.
+`serving.json`의 라우팅을 요청 안에서만 컴파일하고, 경로 후보의 파일 메타데이터만 읽는다.
+선택된 본문의 크기를 확인한 뒤 Storage에서 스트리밍하며 SHA-256 ETag를 유지한다.
+이전 운영 자산도 만료되지 않은 릴리스를 하나씩 확인하고 immutable 파일만 제공한다.
+Site 본문·릴리스·전체 파일 목록·컴파일한 엔진은 요청 사이에 캐시하지 않는다.
+파일 수나 보존 릴리스 수가 서빙 상주 메모리를 늘리지 않으며, 호스트 수와 동시 요청의
+라우팅 설정·Storage I/O 버퍼가 메모리에 영향을 준다. sync와 읽기 전용 API는 게시 검증·GC·
+조회 작업 중 전체 manifest를 일시적으로 읽을 수 있다.
 
-새 라우팅과 캐시는 전체 조회·검증 성공 후 함께 교체한다. 실패하면 이전 snapshot을 유지하고
-1·2·4초 간격으로 최대 세 번 빠르게 재시도한 뒤 새 알림이나 정기 재확인을 기다린다.
-현재 운영·preview·만료 전 이전 자산에서 참조하지 않는 release
-캐시는 제거하며, 자산 만료는 여전히 HTTP 요청마다 확인한다.
+Storage 조회와 요청별 라우팅 컴파일이 늘어나는 대신 상주 메모리를 줄이는 방식이다.
+메타데이터 조회가 실패하면 과거 캐시로 응답하지 않고 503을 반환한다. 삭제·비활성화·기존
+호스트의 배포 전환은 다음 HTTP 요청에서 확인한다. 새 호스트는 인덱스 갱신 후 제공한다.
+인덱스 재조회가 실패하면 이전 호스트 인덱스를 유지하고 1·2·4초 간격으로 최대 세 번
+재시도한 뒤 새 알림이나 정기 재확인을 기다린다. 이때도 각 요청은 Storage를 읽는다.
 
 GitHub 이벤트로 소유 sync를 깨우려면 `run` 또는 지속 실행하는 `sync`에 별도 listener를 켠다.
 
@@ -364,8 +378,9 @@ GitHub 이벤트를 놓치거나 너무 커서 거부했을 때는 소스의 `po
 같은 Catalog에서 기록한 제어 의도는 소유 sync의 제어 반영만 깨우고 GitHub 전체 탐색을
 실행하지 않는다. 별도 CLI 프로세스가 쓴
 `control.json`은 소유 sync의 다음 polling에서 적용한다. `sync`와 `serve`를 별도 프로세스로
-운영하면 게시 알림도 공유되지 않으므로 서빙 반영은 다음 `refresh_interval`에 이루어진다.
-프로세스 사이 알림 전달은 별도 연결이 필요하다.
+운영하면 게시 알림도 공유되지 않으므로 새 사이트·preview 호스트는 다음
+`refresh_interval`에 발견한다. 이미 알고 있는 호스트의 배포 전환·삭제·비활성화는 요청마다
+Storage에서 확인한다. 프로세스 사이 호스트 추가 알림 전달은 별도 연결이 필요하다.
 
 외부 proxy는 webhook의 정확한 경로만 listener로 전달한다. 정적 사이트·gRPC 관리 경로는
 이 webhook 경로에 포함하지 않는다. `gc_grace`는 알림을 놓쳤을 때의 서빙 재확인 주기와

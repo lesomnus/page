@@ -37,9 +37,15 @@ two writers even with one replica. For independent serving availability, run
 process needs object read/list access; sync also needs write/delete and source
 credentials. Page's durable data lives in S3, so its own container needs no PVC.
 
-`run` refreshes serving state after its source commits a publication. The default
-five-minute metadata reconciliation discovers missed notifications and writes
-from other processes; unchanged releases stay cached. Optional GitHub webhooks
+`run` refreshes its hostname index after its source commits a publication. The
+default five-minute reconciliation discovers missed hostname changes and new
+sites from other processes. Every HTTP request reads its current Site, compact
+release routing and candidate file metadata from Storage. File inventories and
+compiled routes are not cached between requests; file bodies stream from
+Storage. This reduces resident serving memory at the cost of additional Storage
+requests and routing compilation per HTTP request. Metadata read failures return
+503 rather than serving a cached publication. Source sync can still allocate full
+release inventories temporarily while validating publications and GC. Optional GitHub webhooks
 use a separate `webhook_listen` port with `GITHUB_WEBHOOK_SECRET` at runtime.
 Forward only `POST /webhooks/github` to that port through HTTPS and keep the
 static-serving and gRPC routes under their existing access policy. See

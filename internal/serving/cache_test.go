@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lesomnus/page/internal/deploy"
+	"github.com/lesomnus/page/internal/routes"
 	"github.com/lesomnus/page/internal/storage"
 )
 
@@ -144,168 +146,146 @@ func rawSite(t *testing.T, store storage.Store, site *deploy.Site) {
 	}
 }
 
-func TestRefreshReusesImmutableReleasesAndReadsOnlyChangedSite(t *testing.T) {
+func TestRefreshReadsOnlyNamespaceMetadata(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
-	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one", "pages.json": `{"schemaVersion":1}`})
-	preview := deploy.AliasToken("branch", "dev")
-	aliases := map[string]deploy.Alias{preview: {Kind: "branch", Name: "dev", Revision: "one", Release: first.ID}}
-	save(t, c, first, aliases)
+	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
+	alias := deploy.AliasToken("branch", "dev")
+	save(t, c, first, map[string]deploy.Alias{alias: {Kind: "branch", Name: "dev", Revision: "one", Release: first.ID}})
 	bar := publish(t, c, "bar", "one", map[string]string{"index.html": "bar"})
 	save(t, c, bar, nil)
 	store.reset()
 	h := handler(t, c, "")
-	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("foo"): 1, deploy.SiteKey("bar"): 1, manifestKey(first): 1, manifestKey(bar): 1})
+	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("foo"): 1, deploy.SiteKey("bar"): 1})
 	store.reset()
 	if err := h.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	requireCalls(t, store, 1, nil)
-	// Writer-side readers return separate mutable values. An uncommitted sync
-	// edit must never alter the serving cache even when the Catalog is shared.
-	uncommitted, err := c.GetSite(context.Background(), "foo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	uncommitted.Production = bar.ID
-	uncommitted.Aliases[preview] = deploy.Alias{Kind: "branch", Name: "dev", Revision: "bad", Release: bar.ID}
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 1, nil)
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "one" {
-		t.Fatalf("uncommitted writer state leaked: %q", got)
-	}
-
-	second := publish(t, c, "foo", "two", map[string]string{"index.html": "two"})
-	save(t, c, second, aliases)
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("foo"): 1, manifestKey(second): 1})
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "two" {
-		t.Fatalf("new release not visible: %q", got)
-	}
-	// Switching back to a release held by a preview requires only the site GET.
-	aliases[preview] = deploy.Alias{Kind: "branch", Name: "dev", Revision: "two", Release: second.ID}
-	save(t, c, first, aliases)
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("foo"): 1})
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "one" {
-		t.Fatalf("cached rollback not visible: %q", got)
+	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("foo"): 1, deploy.SiteKey("bar"): 1})
+	if len(h.current.Load().routes) != 3 {
+		t.Fatal("hostname bindings lost")
 	}
 }
 
-func TestRefreshCachesLegacyPagesMetadata(t *testing.T) {
+func TestWarmRequestsAlwaysReadStorageMetadata(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
-	r := publish(t, c, "foo", "legacy", map[string]string{"index.html": "legacy", "pages.json": `{"schemaVersion":1,"routing":{"cleanUrls":true}}`})
-	r.Pages = nil // A release published before routing was embedded in manifests.
-	body, err := json.Marshal(r)
-	if err != nil {
-		t.Fatal(err)
+	inputs := map[string]string{"index.html": "one"}
+	for i := range 1000 {
+		inputs[fmt.Sprintf("unused/%04d.txt", i)] = "unused"
 	}
-	if _, err := store.Put(context.Background(), manifestKey(r), strings.NewReader(string(body)), int64(len(body)), "application/json"); err != nil {
-		t.Fatal(err)
-	}
+	r := publish(t, c, "foo", "one", inputs)
 	save(t, c, r, nil)
-	store.reset()
 	h := handler(t, c, "")
-	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("foo"): 1, manifestKey(r): 1, deploy.FileKey(r, "pages.json"): 1})
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 1, nil)
-}
-
-func TestRefreshCachesGETFingerprintAcrossListGetRace(t *testing.T) {
-	base := storage.NewMemory()
-	store := &refreshStore{Store: base, fixedModified: true}
-	c := deploy.New(store)
-	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
-	second := publish(t, c, "foo", "two", map[string]string{"index.html": "two"})
-	save(t, c, first, nil)
-	old, _, err := c.GetSiteInfo(context.Background(), "foo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	newSite := *old
-	newSite.Production = second.ID
-	// LIST sees the first object; GET reads its replacement. LastModified and
-	// object length remain identical, as can happen with fast control changes.
-	store.afterList = func() { rawSite(t, base, &newSite) }
-	h := handler(t, c, "")
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "two" {
-		t.Fatalf("replacement not read: %q", got)
-	}
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 1, nil)
-	// Restoring the originally listed bytes must not be mistaken for an
-	// unchanged object because that earlier LIST ETag was never cached.
-	rawSite(t, base, old)
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("foo"): 1, manifestKey(first): 1})
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "one" {
-		t.Fatalf("same-second change missed: %q", got)
+	for range 2 {
+		store.reset()
+		if got := request(h, "GET", "foo.example.com", "/", nil); got.Code != 200 || got.Body.String() != "one" {
+			t.Fatalf("request: %d %q", got.Code, got.Body.String())
+		}
+		gets, lists, heads := store.counts()
+		if lists != 0 || heads < 2 || gets[deploy.SiteKey("foo")] != 1 || gets[manifestKey(r)] != 0 {
+			t.Fatalf("request metadata calls: GET=%v LIST=%d HEAD=%d", gets, lists, heads)
+		}
+		if len(gets) != 3 {
+			t.Fatalf("request should read site, compact release and candidate file only: %v", gets)
+		}
 	}
 }
 
-func TestRefreshWithoutETagReadsSiteButReusesRelease(t *testing.T) {
-	store := &refreshStore{Store: storage.NewMemory(), missingETag: true}
+func TestMetadataFailuresNeverServeStaleConfiguration(t *testing.T) {
+	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
 	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, r, nil)
 	h := handler(t, c, "")
 	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
+		t.Fatal(got)
 	}
-	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("foo"): 1})
+	gets, _, _ := store.counts()
+	for key := range gets {
+		t.Run(key, func(t *testing.T) {
+			store.fail(key, true)
+			if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != http.StatusServiceUnavailable {
+				t.Fatalf("metadata failure used stale values: %d", got)
+			}
+			store.fail(key, false)
+		})
+	}
 }
 
-func TestRefreshFailureDoesNotAdvanceCaches(t *testing.T) {
+func TestFreshSiteChangesRevokeWithoutNamespaceRefresh(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
-	bar := publish(t, c, "bar", "one", map[string]string{"index.html": "bar-one"})
-	foo := publish(t, c, "foo", "one", map[string]string{"index.html": "foo-one"})
-	save(t, c, bar, nil)
-	save(t, c, foo, nil)
+	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
+	token := deploy.AliasToken("branch", "dev")
+	save(t, c, first, map[string]deploy.Alias{token: {Kind: "branch", Name: "dev", Revision: "one", Release: first.ID}})
 	h := handler(t, c, "")
-	bar2 := publish(t, c, "bar", "two", map[string]string{"index.html": "bar-two"})
-	foo2 := publish(t, c, "foo", "two", map[string]string{"index.html": "foo-two"})
-	save(t, c, bar2, nil)
-	save(t, c, foo2, nil)
-	store.fail(manifestKey(foo2), true)
+	store.failLists.Store(true)
+	second := publish(t, c, "foo", "two", map[string]string{"index.html": "two"})
+	save(t, c, second, nil)
 	if err := h.Refresh(context.Background()); err == nil {
-		t.Fatal("accepted incomplete refresh")
+		t.Fatal("expected LIST failure")
 	}
-	if got := request(h, "GET", "bar.example.com", "/", nil).Body.String(); got != "bar-one" {
-		t.Fatalf("partially advanced snapshot: %q", got)
+	if got := request(h, "GET", "foo.example.com", "/", nil); got.Code != 200 || got.Body.String() != "two" {
+		t.Fatalf("fresh release hidden behind old namespace: %d %q", got.Code, got.Body.String())
 	}
-	store.fail(manifestKey(foo2), false)
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
+	if got := request(h, "GET", deploy.Host("example.com", "flat", "foo", token), "/", nil).Code; got != 404 {
+		t.Fatalf("removed alias still served: %d", got)
+	}
+	site, err := c.GetSite(context.Background(), "foo")
+	if err != nil {
 		t.Fatal(err)
 	}
-	requireCalls(t, store, 1, map[string]int{deploy.SiteKey("bar"): 1, deploy.SiteKey("foo"): 1, manifestKey(bar2): 1, manifestKey(foo2): 1})
-	if got := request(h, "GET", "bar.example.com", "/", nil).Body.String(); got != "bar-two" {
-		t.Fatalf("recovery missed change: %q", got)
+	site.Disabled = true
+	rawSite(t, store.Store, site)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
+		t.Fatalf("disabled site still served: %d", got)
+	}
+	if err := store.Delete(context.Background(), deploy.SiteKey("foo")); err != nil {
+		t.Fatal(err)
+	}
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
+		t.Fatalf("deleted site still served: %d", got)
 	}
 }
 
-func TestRefreshCompletesPaginationBeforePruning(t *testing.T) {
+func TestRequestsValidateRepositoryAndPreviewRevision(t *testing.T) {
+	store := storage.NewMemory()
+	c := deploy.New(store)
+	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
+	token := deploy.AliasToken("branch", "dev")
+	save(t, c, r, map[string]deploy.Alias{token: {Kind: "branch", Name: "dev", Revision: "one", Release: r.ID}})
+	h := handler(t, c, "")
+	site, err := c.GetSite(context.Background(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	site.RepositoryID = "another-repository"
+	rawSite(t, store, site)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
+		t.Fatalf("new repository reused old binding: %d", got)
+	}
+	// Reconciliation can accept a new binding, but never a release owned by the
+	// former repository. Production metadata is validated on every request.
+	if err := h.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
+		t.Fatalf("release repository mismatch: %d", got)
+	}
+	site.RepositoryID = r.Origin.RepositoryID
+	site.Aliases[token] = deploy.Alias{Kind: "branch", Name: "dev", Revision: "wrong", Release: r.ID}
+	rawSite(t, store, site)
+	if err := h.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := request(h, "GET", deploy.Host("example.com", "flat", "foo", token), "/", nil).Code; got != 503 {
+		t.Fatalf("preview revision mismatch: %d", got)
+	}
+}
+
+func TestRefreshCompletesPaginationBeforeReplacingNamespace(t *testing.T) {
 	base := storage.NewMemory()
 	store := &refreshStore{Store: base, pageLimit: 1}
 	c := deploy.New(store)
@@ -313,101 +293,55 @@ func TestRefreshCompletesPaginationBeforePruning(t *testing.T) {
 	bar := publish(t, c, "bar", "one", map[string]string{"index.html": "bar"})
 	save(t, c, foo, nil)
 	save(t, c, bar, nil)
-	if _, err := base.Put(context.Background(), "sites/aaa/control.json", strings.NewReader("{}"), 2, "application/json"); err != nil {
-		t.Fatal(err)
-	}
 	h := handler(t, c, "")
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 3, nil)
+	before := h.current.Load()
 	if err := base.Delete(context.Background(), deploy.SiteKey("foo")); err != nil {
 		t.Fatal(err)
 	}
 	store.failContinuation.Store(true)
+	// Ensure pagination still needs a second page after the deletion.
+	if _, err := base.Put(context.Background(), "sites/aaa/control.json", strings.NewReader("{}"), 2, "application/json"); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.Refresh(context.Background()); err == nil {
 		t.Fatal("accepted partial inventory")
 	}
-	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != http.StatusOK {
-		t.Fatalf("partial inventory revoked site: %d", got)
+	if h.current.Load() != before {
+		t.Fatal("partial inventory replaced namespace")
+	}
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
+		t.Fatalf("deleted site served through retained binding: %d", got)
+	}
+	if got := request(h, "GET", "bar.example.com", "/", nil).Code; got != 200 {
+		t.Fatalf("existing site lost: %d", got)
 	}
 	store.failContinuation.Store(false)
 	if err := h.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != http.StatusNotFound {
-		t.Fatalf("completed inventory did not revoke site: %d", got)
+	if len(h.current.Load().routes) != 1 {
+		t.Fatal("removed hostname retained after complete inventory")
 	}
-	if len(h.releases) != 1 || len(h.sites) != 1 {
-		t.Fatalf("removed site retained in cache: %d releases, %d sites", len(h.releases), len(h.sites))
-	}
-	// Reintroducing a previously evicted release requires a fresh manifest read.
-	save(t, c, foo, nil)
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 3, map[string]int{deploy.SiteKey("foo"): 1, manifestKey(foo): 1})
 }
 
-func TestRefreshValidatesOwnershipAndRevisionOnCacheHit(t *testing.T) {
+func TestSelectedObjectStatPreservesMissingAndSizeValidation(t *testing.T) {
 	base := storage.NewMemory()
 	c := deploy.New(base)
 	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, r, nil)
 	h := handler(t, c, "")
-	site, err := c.GetSite(context.Background(), "foo")
-	if err != nil {
+	key := deploy.FileKey(r, "index.html")
+	if _, err := base.Put(context.Background(), key, strings.NewReader("different"), 9, "text/html"); err != nil {
 		t.Fatal(err)
 	}
-	site.RepositoryID = "another-repository"
-	rawSite(t, base, site)
-	if err := h.Refresh(context.Background()); err == nil {
-		t.Fatal("cache bypassed repository ownership validation")
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
+		t.Fatalf("size mismatch: %d", got)
 	}
-	site.RepositoryID = r.Origin.RepositoryID
-	site.Aliases[deploy.AliasToken("branch", "dev")] = deploy.Alias{Kind: "branch", Name: "dev", Revision: "wrong", Release: r.ID}
-	rawSite(t, base, site)
-	if err := h.Refresh(context.Background()); err == nil {
-		t.Fatal("cache bypassed preview revision validation")
-	}
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "one" {
-		t.Fatalf("invalid metadata replaced snapshot: %q", got)
-	}
-}
-
-func TestRefreshExpiresAssetCacheWithoutMetadataChange(t *testing.T) {
-	store := &refreshStore{Store: storage.NewMemory()}
-	c := deploy.New(store)
-	old := publish(t, c, "foo", "old", map[string]string{"index.html": "old", "pages.json": `{"schemaVersion":1,"assets":{"immutable":["/assets/*"]}}`, "assets/old.js": "old-js"})
-	save(t, c, old, nil)
-	next := publish(t, c, "foo", "new", map[string]string{"index.html": "new"})
-	save(t, c, next, nil)
-	site, err := c.GetSite(context.Background(), "foo")
-	if err != nil {
+	if err := base.Delete(context.Background(), key); err != nil {
 		t.Fatal(err)
 	}
-	// SaveSite's asset retention comes from source config; install a lease here
-	// to make time passage independent of writes and wall-clock test duration.
-	until := time.Now().Add(time.Hour)
-	site.AssetReleases = map[string]time.Time{old.ID: until}
-	rawSite(t, store.Store, site)
-	h := handler(t, c, "")
-	if got := request(h, "GET", "foo.example.com", "/assets/old.js", nil).Code; got != http.StatusOK {
-		t.Fatalf("lease missing before expiry: %d", got)
-	}
-	h.now = func() time.Time { return until.Add(time.Second) }
-	if got := request(h, "GET", "foo.example.com", "/assets/old.js", nil).Code; got != http.StatusNotFound {
-		t.Fatalf("lease expiry required a refresh: %d", got)
-	}
-	store.reset()
-	if err := h.Refresh(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	requireCalls(t, store, 1, nil)
-	if len(h.releases) != 1 {
-		t.Fatalf("expired assets retained in cache: %d releases", len(h.releases))
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 404 {
+		t.Fatalf("missing selected object: %d", got)
 	}
 }
 
@@ -451,7 +385,7 @@ func TestRunBoundsFastRetriesUntilAnotherPublication(t *testing.T) {
 	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, first, nil)
 	h := runHandlerWithRetry(t, c, time.Hour, time.Millisecond)
-	second := publish(t, c, "foo", "two", map[string]string{"index.html": "two"})
+	second := publish(t, c, "bar", "two", map[string]string{"index.html": "two"})
 	store.failLists.Store(true)
 	save(t, c, second, nil)
 	waitFor(t, func() bool { return store.failedLists.Load() >= 4 })
@@ -460,65 +394,62 @@ func TestRunBoundsFastRetriesUntilAnotherPublication(t *testing.T) {
 		t.Fatalf("unbounded retries after one failed notification: %d attempts", got)
 	}
 	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "one" {
-		t.Fatalf("retry exhaustion discarded prior snapshot: %q", got)
+		t.Fatalf("retry exhaustion discarded namespace: %q", got)
 	}
-	// Recovery alone does not restart a hot retry loop. A new publication must
-	// replenish the budget and wake the reader before its periodic hour tick.
 	store.failLists.Store(false)
 	time.Sleep(10 * time.Millisecond)
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "one" {
-		t.Fatalf("exhausted loop woke without an event: %q", got)
+	if got := request(h, "GET", "bar.example.com", "/", nil).Code; got != 404 {
+		t.Fatalf("exhausted loop woke without an event: %d", got)
 	}
 	save(t, c, second, nil)
-	waitFor(t, func() bool { return request(h, "GET", "foo.example.com", "/", nil).Body.String() == "two" })
+	waitFor(t, func() bool { return request(h, "GET", "bar.example.com", "/", nil).Body.String() == "two" })
 }
 
-func TestRunRefreshesOnPublicationAndRetriesLostAttempt(t *testing.T) {
+func TestRunRefreshesNamespaceOnPublicationAndRetriesLostAttempt(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
 	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, first, nil)
 	h := runHandler(t, c, time.Hour)
-	second := publish(t, c, "foo", "two", map[string]string{"index.html": "two"})
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "one" {
-		t.Fatalf("unpublished release activated: %q", got)
+	second := publish(t, c, "bar", "two", map[string]string{"index.html": "two"})
+	if got := request(h, "GET", "bar.example.com", "/", nil).Code; got != 404 {
+		t.Fatalf("unpublished namespace activated: %d", got)
 	}
 	save(t, c, second, nil)
-	waitFor(t, func() bool { return request(h, "GET", "foo.example.com", "/", nil).Body.String() == "two" })
-	third := publish(t, c, "foo", "three", map[string]string{"index.html": "three"})
+	waitFor(t, func() bool { return request(h, "GET", "bar.example.com", "/", nil).Body.String() == "two" })
+	third := publish(t, c, "baz", "three", map[string]string{"index.html": "three"})
 	store.failLists.Store(true)
 	save(t, c, third, nil)
 	waitFor(t, func() bool { return store.failedLists.Load() > 0 })
-	if got := request(h, "GET", "foo.example.com", "/", nil).Body.String(); got != "two" {
-		t.Fatalf("failed notification discarded current snapshot: %q", got)
+	if got := request(h, "GET", "bar.example.com", "/", nil).Body.String(); got != "two" {
+		t.Fatalf("failed notification discarded namespace: %q", got)
 	}
-	// No further publication signal: retry must recover before the hour ticker.
 	store.failLists.Store(false)
-	waitFor(t, func() bool { return request(h, "GET", "foo.example.com", "/", nil).Body.String() == "three" })
+	waitFor(t, func() bool { return request(h, "GET", "baz.example.com", "/", nil).Body.String() == "three" })
 }
 
-func TestRunPeriodicReconciliationFindsOtherProcessWrites(t *testing.T) {
+func TestRunPeriodicReconciliationFindsOtherProcessNamespaces(t *testing.T) {
 	base := storage.NewMemory()
 	c := deploy.New(base)
 	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, first, nil)
 	h := runHandler(t, c, 10*time.Millisecond)
 	otherProcess := deploy.New(base)
-	second := publish(t, otherProcess, "foo", "two", map[string]string{"index.html": "two"})
+	second := publish(t, otherProcess, "bar", "two", map[string]string{"index.html": "two"})
 	save(t, otherProcess, second, nil)
-	waitFor(t, func() bool { return request(h, "GET", "foo.example.com", "/", nil).Body.String() == "two" })
+	waitFor(t, func() bool { return request(h, "GET", "bar.example.com", "/", nil).Body.String() == "two" })
 }
 
 func TestRunKeepsNotificationDuringStartupRefresh(t *testing.T) {
 	store := &refreshStore{Store: storage.NewMemory()}
 	c := deploy.New(store)
 	first := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
-	second := publish(t, c, "foo", "two", map[string]string{"index.html": "two"})
+	second := publish(t, c, "bar", "two", map[string]string{"index.html": "two"})
 	save(t, c, first, nil)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	store.afterGet = func(key string) {
-		if key == manifestKey(first) {
+		if key == deploy.SiteKey("foo") {
 			once.Do(func() { close(entered); <-release })
 		}
 	}
@@ -535,17 +466,15 @@ func TestRunKeepsNotificationDuringStartupRefresh(t *testing.T) {
 		close(release)
 		cancel()
 		<-done
-		t.Fatal("startup refresh did not reach old manifest")
+		t.Fatal("startup refresh did not read site metadata")
 	}
-	// SaveSite itself rereads old manifests. Let those calls proceed while the
-	// startup read stays blocked, without depending on goroutine scheduling.
 	store.mu.Lock()
 	store.afterGet = nil
 	store.mu.Unlock()
 	save(t, c, second, nil)
 	close(release)
 	t.Cleanup(func() { cancel(); <-done })
-	waitFor(t, func() bool { return request(h, "GET", "foo.example.com", "/", nil).Body.String() == "two" })
+	waitFor(t, func() bool { return request(h, "GET", "bar.example.com", "/", nil).Body.String() == "two" })
 }
 
 func TestDefaultReconciliationInterval(t *testing.T) {
@@ -555,5 +484,141 @@ func TestDefaultReconciliationInterval(t *testing.T) {
 	}
 	if h.config.RefreshInterval != 5*time.Minute {
 		t.Fatalf("default refresh interval: %s", h.config.RefreshInterval)
+	}
+}
+
+func TestCorruptServingMetadataReturnsUnavailable(t *testing.T) {
+	base := storage.NewMemory()
+	c := deploy.New(base)
+	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
+	save(t, c, r, nil)
+	h := handler(t, c, "")
+	ctx := context.Background()
+	rel, err := c.GetServingRelease(ctx, r.Owner, r.Site, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := c.GetServingFile(ctx, rel, "index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(key string, value any) {
+		t.Helper()
+		body, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := base.Put(ctx, key, strings.NewReader(string(body)), int64(len(body)), "application/json"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file.RepositoryID = "another-repository"
+	put(deploy.ServingFileKey(rel, "index.html"), file)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
+		t.Fatalf("corrupt point metadata: %d", got)
+	}
+	file.RepositoryID = rel.Origin.RepositoryID
+	put(deploy.ServingFileKey(rel, "index.html"), file)
+	rel.Pages = &routes.Config{SchemaVersion: 1, Headers: []routes.HeaderRule{{From: "/*", Set: map[string]string{"Set-Cookie": "secret"}}}}
+	put(deploy.ServingReleaseKey(rel), rel)
+	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
+		t.Fatalf("unsafe routing metadata: %d", got)
+	}
+}
+
+func TestDeclaredMissingBodyDoesNotBecomeSPAFallback(t *testing.T) {
+	base := storage.NewMemory()
+	c := deploy.New(base)
+	r := publish(t, c, "foo", "one", map[string]string{
+		"index.html":    "SPA",
+		"assets/app.js": "app",
+		"pages.json":    `{"schemaVersion":1,"routing":{"fallback":{"rewrite":"/index.html"}}}`,
+	})
+	save(t, c, r, nil)
+	h := handler(t, c, "")
+	if err := base.Delete(context.Background(), deploy.FileKey(r, "assets/app.js")); err != nil {
+		t.Fatal(err)
+	}
+	if got := request(h, "GET", "foo.example.com", "/assets/app.js", map[string]string{"Accept": "text/html"}); got.Code != 404 || strings.Contains(got.Body.String(), "SPA") {
+		t.Fatalf("missing body became fallback: %d %q", got.Code, got.Body.String())
+	}
+}
+
+func TestLegacyHTTPReadsMetadataOnEveryRequest(t *testing.T) {
+	base := storage.NewMemory()
+	store := &refreshStore{Store: base}
+	c := deploy.New(store)
+	r := publish(t, c, "foo", "legacy", map[string]string{"index.html": "legacy", "about.html": "about", "pages.json": `{"schemaVersion":1,"routing":{"cleanUrls":true}}`})
+	r.Pages = nil
+	body, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.Put(context.Background(), manifestKey(r), strings.NewReader(string(body)), int64(len(body)), "application/json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Delete(context.Background(), deploy.ReleasePrefix(r.Owner, r.Site, r.ID)+"serving.json"); err != nil {
+		t.Fatal(err)
+	}
+	save(t, c, r, nil)
+	h := handler(t, c, "")
+	for range 2 {
+		store.reset()
+		if got := request(h, "GET", "foo.example.com", "/about", nil); got.Code != 200 || got.Body.String() != "about" {
+			t.Fatalf("legacy clean URL: %d %q", got.Code, got.Body.String())
+		}
+		gets, _, _ := store.counts()
+		if gets[manifestKey(r)] < 2 || gets[deploy.FileKey(r, "pages.json")] < 2 {
+			t.Fatalf("legacy metadata was cached: %v", gets)
+		}
+	}
+}
+
+func TestPreviousAssetsUseNewestLeaseAndPropagateMetadataFailure(t *testing.T) {
+	base := storage.NewMemory()
+	store := &refreshStore{Store: base}
+	c := deploy.New(store)
+	old := publish(t, c, "foo", "old", map[string]string{
+		"assets/app.js": "old",
+		"pages.json":    `{"schemaVersion":1,"assets":{"immutable":["/assets/*"]}}`,
+	})
+	newer := publish(t, c, "foo", "newer", map[string]string{
+		"assets/app.js": "newer",
+		"pages.json":    `{"schemaVersion":1,"assets":{"immutable":["/assets/*"]}}`,
+	})
+	current := publish(t, c, "foo", "current", map[string]string{"index.html": "current"})
+	save(t, c, current, nil)
+	site, err := c.GetSite(context.Background(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(time.Hour)
+	// Install the leases directly so this test can exercise deterministic
+	// selection even when two historical releases disagree on the same URL.
+	// Ordinary publication forbids that immutable content collision.
+	site.AssetReleases = map[string]time.Time{old.ID: until, newer.ID: until}
+	rawSite(t, base, site)
+	h := handler(t, c, "")
+	for range 5 {
+		if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil); got.Code != 200 || got.Body.String() != "newer" {
+			t.Fatalf("lease order depended on map iteration: %d %q", got.Code, got.Body.String())
+		}
+	}
+	rel, err := c.GetServingRelease(context.Background(), newer.Owner, newer.Site, newer.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.fail(deploy.ServingFileKey(rel, "assets/app.js"), true)
+	if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 503 {
+		t.Fatalf("old file metadata failure became not found/stale asset: %d", got)
+	}
+	store.fail(deploy.ServingFileKey(rel, "assets/app.js"), false)
+	store.fail(deploy.ServingReleaseKey(rel), true)
+	if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 503 {
+		t.Fatalf("old release metadata failure became not found/stale asset: %d", got)
+	}
+	h.now = func() time.Time { return until.Add(time.Second) }
+	if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 404 {
+		t.Fatalf("expired old release was still read: %d", got)
 	}
 }
