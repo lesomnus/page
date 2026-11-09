@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.27.3-trixie@sha256:fbb7ae40b62ff8afe31662df570d39b4f5052ac32b90dae8e60d7657a20a74f4 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-trixie@sha256:af1bfc2614ebb1dbd31af514b78740fd678850e76498762b425ecee4c5c6ea80 AS build
 WORKDIR /src
 ENV GOTOOLCHAIN=local
 COPY go.mod go.sum ./
@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w -X github.com/lesomnus/payday/version.version=${APP_VERSION}" \
       -o /out/page ./cmd/page
 
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99 AS app
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329 AS app
 COPY --from=build /out/page /usr/local/bin/page
 USER 65532:65532
 WORKDIR /app
