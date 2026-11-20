@@ -421,7 +421,7 @@ func TestGitHubToServingAndSourceOwnedGC(t *testing.T) {
 	}
 	assertHTTP(t, h, "foo.example.com", 200, "snapshot-"+sha(3))
 	assertHTTP(t, h, deploy.Host("example.com", "flat", "foo", deploy.AliasToken("commit", sha(1))), 404, "")
-	if _, err := store.Stat(ctx, deploy.FileKey(old, "index.html")); err != nil {
+	if _, err := store.Stat(ctx, deploy.ReleasePrefix(old.Owner, old.Site, old.ID)+"release.json"); err != nil {
 		t.Fatal("old release removed before grace:", err)
 	}
 	now = now.Add(2 * time.Second)
@@ -429,13 +429,13 @@ func TestGitHubToServingAndSourceOwnedGC(t *testing.T) {
 	s = newSync(t, cat, cfg)
 	s.now = func() time.Time { return now }
 	mustOnce(t, s)
-	if _, err := store.Stat(ctx, deploy.FileKey(old, "index.html")); !errors.Is(err, storage.ErrNotFound) {
+	if _, err := store.Stat(ctx, deploy.ReleasePrefix(old.Owner, old.Site, old.ID)+"release.json"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatal("expired release still exists:", err)
 	}
 	if _, err := store.Stat(ctx, deploy.ReleasePrefix(cfg.ID, "foo", pendingID)+"upload.json"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatal("unfinished upload still exists:", err)
 	}
-	if _, err := store.Stat(ctx, deploy.FileKey(other, "index.html")); err != nil {
+	if _, err := store.Stat(ctx, deploy.ReleasePrefix(other.Owner, other.Site, other.ID)+"release.json"); err != nil {
 		t.Fatal("other owner's release removed:", err)
 	}
 	if err := h.Refresh(ctx); err != nil {

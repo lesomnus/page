@@ -47,12 +47,12 @@ func TestRoutingValidationBeforeCompletionAndPersistedConfigRead(t *testing.T) {
 	if e != nil || read.Pages == nil || !read.Pages.Routing.CleanURLs {
 		t.Fatalf("persisted routing config not loaded: %v %v", read, e)
 	}
-	if len(store.gets) != 1 || store.gets[0] != ReleasePrefix(valid.Owner, valid.Site, valid.ID)+"manifest.json" {
+	if len(store.gets) != 1 || store.gets[0] != ReleasePrefix(valid.Owner, valid.Site, valid.ID)+releaseObject {
 		t.Fatalf("release read fetched file bodies: %v", store.gets)
 	}
 	pages := valid.Pages
 	valid.Pages = nil
-	if e = c.write(ctx, ReleasePrefix(valid.Owner, valid.Site, valid.ID)+"manifest.json", valid); e != nil {
+	if e = c.write(ctx, ReleasePrefix(valid.Owner, valid.Site, valid.ID)+releaseObject, valid); e != nil {
 		t.Fatal(e)
 	}
 	store.gets = nil
@@ -64,7 +64,7 @@ func TestRoutingValidationBeforeCompletionAndPersistedConfigRead(t *testing.T) {
 	}
 	valid.Pages = pages
 	delete(valid.Files, "pages.json")
-	if e = c.write(ctx, ReleasePrefix(valid.Owner, valid.Site, valid.ID)+"manifest.json", valid); e != nil {
+	if e = c.write(ctx, ReleasePrefix(valid.Owner, valid.Site, valid.ID)+releaseObject, valid); e != nil {
 		t.Fatal(e)
 	}
 	if _, e = c.GetRelease(ctx, "source", "foo", valid.ID); !errors.Is(e, ErrInvalid) {
@@ -76,7 +76,8 @@ type corruptPublicationPages struct{ storage.Store }
 
 func (s corruptPublicationPages) Get(ctx context.Context, key string) (io.ReadCloser, storage.Info, error) {
 	body, info, err := s.Store.Get(ctx, key)
-	if err == nil && strings.HasSuffix(key, "/files/pages.json") {
+	// Publication reads only pages.json back from storage.
+	if err == nil && strings.Contains(key, "/blobs/") {
 		body.Close()
 		return io.NopCloser(strings.NewReader("tampered")), info, nil
 	}

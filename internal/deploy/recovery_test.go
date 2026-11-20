@@ -19,7 +19,7 @@ type interruptedDelete struct {
 }
 
 func (s *interruptedDelete) Delete(ctx context.Context, key string) error {
-	if s.fail && strings.Contains(key, "/files/") {
+	if s.fail && strings.Contains(key, "/"+indexDir) {
 		s.deletes++
 		if s.deletes == 2 {
 			return errors.New("delete interrupted")
@@ -62,7 +62,7 @@ func TestPartialGCThenReselectionRepublishesCompleteFiles(t *testing.T) {
 		t.Fatal(e)
 	}
 	for name := range again.Files {
-		body, _, e := store.Get(ctx, FileKey(again, name))
+		body, _, e := store.Get(ctx, BlobKey(again.Owner, again.Site, again.Files[name].SHA256))
 		if e != nil {
 			t.Fatal(e)
 		}

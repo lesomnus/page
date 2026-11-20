@@ -301,7 +301,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if file, ok := files[p]; ok {
 			return file != nil, nil
 		}
-		file, err := h.catalog.GetServingFile(r.Context(), rel, p)
+		file, err := h.servingFile(r.Context(), rel, p)
 		if errors.Is(err, storage.ErrNotFound) {
 			files[p] = nil
 			return false, nil
@@ -354,7 +354,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	file := selected.File
-	key := deploy.ServingObjectKey(rel, decision.Path)
+	key := deploy.ServingBlobKey(rel, file)
 	info, err := h.catalog.Store.Stat(r.Context(), key)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -485,7 +485,7 @@ func (h *Handler) previousAsset(ctx context.Context, site *deploy.Site, p string
 		if chosen != nil && (old.CreatedAt.Before(chosen.CreatedAt) || (old.CreatedAt.Equal(chosen.CreatedAt) && old.ID >= chosen.ID)) {
 			continue
 		}
-		file, err := h.catalog.GetServingFile(ctx, old, p)
+		file, err := h.servingFile(ctx, old, p)
 		if errors.Is(err, storage.ErrNotFound) {
 			continue
 		}

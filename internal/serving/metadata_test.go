@@ -29,13 +29,14 @@ func TestDiskCacheReloadsCompiledReleaseAndRefreshSeedsMutableSite(t *testing.T)
 	// tier. Requests recover both records without per-request origin checks.
 	restarted := handlerWithCache(t, c, config)
 	store.reset()
-	store.fail(deploy.ReleasePrefix(r.Owner, r.Site, r.ID)+"serving.json", true)
+	store.fail(deploy.ReleasePrefix(r.Owner, r.Site, r.ID)+"serving-v2.json", true)
 	store.fail(manifestKey(r), true)
 	if got := request(restarted, "GET", "foo.example.com", "/", nil); got.Code != 200 || got.Header().Get("X-Disk") != "reloaded" {
 		t.Fatalf("disk reuse needed unavailable immutable origin: %d %q", got.Code, got.Body.String())
 	}
 	gets, lists, heads := store.counts()
-	if len(gets) != 1 || gets[deploy.SiteKey("foo")] != 0 || lists != 0 || heads != 1 {
+	// The index shard is immutable metadata too, so the disk tier serves it.
+	if len(gets) != 0 || lists != 0 || heads != 1 {
 		t.Fatalf("disk request rechecked metadata: GET%v LIST%d HEAD%d", gets, lists, heads)
 	}
 	again := handlerWithCache(t, c, config)
@@ -99,7 +100,7 @@ func TestReleaseCapacityEvictionPromotesDiskWithoutOrigin(t *testing.T) {
 		t.Fatalf("small memory tier did not evict an old release: %+v", stats)
 	}
 	store.reset()
-	store.fail(deploy.ReleasePrefix(first.Owner, first.Site, first.ID)+"serving.json", true)
+	store.fail(deploy.ReleasePrefix(first.Owner, first.Site, first.ID)+"serving-v2.json", true)
 	store.fail(manifestKey(first), true)
 	reloaded, err := h.cachedRelease(ctx, site, first.ID)
 	if err != nil {
