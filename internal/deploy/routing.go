@@ -41,7 +41,7 @@ func (c *Catalog) parsePagesForPublication(ctx context.Context, r *Release) erro
 		if f.Size > 65536 {
 			return fmt.Errorf("%w: pages.json exceeds 64 KiB", ErrInvalid)
 		}
-		body, _, e := c.Store.Get(ctx, FileKey(r, "pages.json"))
+		body, _, e := c.Store.Get(ctx, BlobKey(r.Owner, r.Site, f.SHA256))
 		if e != nil {
 			return e
 		}

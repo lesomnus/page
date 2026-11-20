@@ -71,7 +71,7 @@ type brokenStore struct {
 }
 
 func (b *brokenStore) Put(ctx context.Context, key string, r io.Reader, n int64, typ string) (storage.Info, error) {
-	if b.fail && strings.Contains(key, "/files/") {
+	if b.fail && strings.Contains(key, "/blobs/") {
 		return storage.Info{}, errors.New("upload interrupted")
 	}
 	return b.Store.Put(ctx, key, r, n, typ)
@@ -184,5 +184,46 @@ func TestSaveSiteSkipsUnchangedSite(t *testing.T) {
 	got, err := c.GetSite(ctx, "foo")
 	if err != nil || got.Production != r2.ID || !got.UpdatedAt.After(first) {
 		t.Fatalf("changed site not stored: %+v %v", got, err)
+	}
+}
+
+func TestCollectBlobsKeepsBodiesOfRemainingReleases(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	c := New(store)
+	old, err := c.Publish(ctx, "foo", "source-foo", origin("old"), []InputFile{input("index.html", "old"), input("shared.js", "same")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err := c.Publish(ctx, "foo", "source-foo", origin("new"), []InputFile{input("index.html", "new"), input("shared.js", "same")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := siteFor(cur)
+	if err = c.SaveSite(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.DeleteRelease(ctx, s, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := c.CollectBlobs(ctx, s); err != nil || n != 0 {
+		t.Fatalf("collected bodies inside the grace period: %d %v", n, err)
+	}
+	c.clock = func() time.Time { return time.Now().Add(BlobGrace + time.Minute) }
+	if n, err := c.CollectBlobs(ctx, s); err != nil || n != 1 {
+		t.Fatalf("collected %d bodies, want only the old index.html: %v", n, err)
+	}
+	if _, err := store.Stat(ctx, BlobKey(old.Owner, old.Site, old.Files["index.html"].SHA256)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unreferenced body kept: %v", err)
+	}
+	for _, f := range cur.Files {
+		if _, err := store.Stat(ctx, BlobKey(cur.Owner, cur.Site, f.SHA256)); err != nil {
+			t.Fatalf("body of the remaining release collected: %s %v", f.Path, err)
+		}
+	}
+	foreign := *s
+	foreign.Owner = "another-source"
+	if _, err := c.CollectBlobs(ctx, &foreign); !errors.Is(err, ErrOwnership) {
+		t.Fatalf("collected another source's bodies: %v", err)
 	}
 }

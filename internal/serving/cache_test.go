@@ -145,7 +145,7 @@ func requireCalls(t *testing.T, store *refreshStore, listCount int, wanted map[s
 }
 
 func manifestKey(r *deploy.Release) string {
-	return deploy.ReleasePrefix(r.Owner, r.Site, r.ID) + "manifest.json"
+	return deploy.ReleasePrefix(r.Owner, r.Site, r.ID) + "release.json"
 }
 
 func rawSite(t *testing.T, store storage.Store, site *deploy.Site) {
@@ -237,7 +237,7 @@ func TestConcurrentRequestsShareSiteReleaseAndCompiledRoutes(t *testing.T) {
 	}
 	// The explicit reader above accounts for the second descriptor GET.
 	gets, _, _ = store.counts()
-	if gets[deploy.ServingReleaseKey(rel)] != 2 || gets[deploy.ServingFileKey(rel, "index.html")] != 50 || len(gets) != 3 {
+	if gets[deploy.ServingReleaseKey(rel)] != 2 || gets[deploy.ServingIndexKey(rel, deploy.IndexShard("index.html"))] != 1 || len(gets) != 3 {
 		t.Fatalf("burst did not share descriptor or cached file inventory: %v", gets)
 	}
 	site, err := h.cachedSite(context.Background(), "foo")
@@ -349,8 +349,13 @@ func TestCachedMetadataAndDiskPromotionContinueWithoutOriginChecks(t *testing.T)
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 200 {
 		t.Fatalf("immutable descriptor unnecessarily reloaded: %d", got)
 	}
-	store.fail(deploy.ServingFileKey(rel, "index.html"), true)
-	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
+	// The index shard of "/" is cached with its immutable release; a shard this
+	// reader has not loaded yet must still surface a Storage failure.
+	if deploy.IndexShard("missing.html") == deploy.IndexShard("index.html") {
+		t.Fatal("pick a path in another index shard")
+	}
+	store.fail(deploy.ServingIndexKey(rel, deploy.IndexShard("missing.html")), true)
+	if got := request(h, "GET", "foo.example.com", "/missing.html", nil).Code; got != 503 {
 		t.Fatalf("uncached file metadata failure swallowed: %d", got)
 	}
 }
@@ -482,7 +487,7 @@ func TestSelectedObjectStatPreservesMissingAndSizeValidation(t *testing.T) {
 	r := publish(t, c, "foo", "one", map[string]string{"index.html": "one"})
 	save(t, c, r, nil)
 	h := handler(t, c, "")
-	key := deploy.FileKey(r, "index.html")
+	key := deploy.BlobKey(r.Owner, r.Site, r.Files["index.html"].SHA256)
 	if _, err := base.Put(context.Background(), key, strings.NewReader("different"), 9, "text/html"); err != nil {
 		t.Fatal(err)
 	}
@@ -665,12 +670,16 @@ func TestCorruptServingMetadataReturnsUnavailable(t *testing.T) {
 		}
 	}
 	file.RepositoryID = "another-repository"
-	put(deploy.ServingFileKey(rel, "index.html"), file)
+	shard := deploy.IndexShard("index.html")
+	index := func(f *deploy.ServingFile) *deploy.ServingIndex {
+		return &deploy.ServingIndex{SchemaVersion: f.SchemaVersion, Owner: f.Owner, Site: f.Site, ReleaseID: f.ReleaseID, RepositoryID: f.RepositoryID, CreatedAt: f.CreatedAt, Shard: shard, Files: map[string]deploy.ServingIndexEntry{f.File.Path: {File: f.File, Immutable: f.Immutable}}}
+	}
+	put(deploy.ServingIndexKey(rel, shard), index(file))
 	if got := request(h, "GET", "foo.example.com", "/", nil).Code; got != 503 {
 		t.Fatalf("corrupt point metadata: %d", got)
 	}
 	file.RepositoryID = rel.Origin.RepositoryID
-	put(deploy.ServingFileKey(rel, "index.html"), file)
+	put(deploy.ServingIndexKey(rel, shard), index(file))
 	rel.Pages = &routes.Config{SchemaVersion: 1, Headers: []routes.HeaderRule{{From: "/*", Set: map[string]string{"Set-Cookie": "secret"}}}}
 	put(deploy.ServingReleaseKey(rel), rel)
 	// A cold reader must validate immutable routing from Storage. A warm reader
@@ -691,7 +700,7 @@ func TestDeclaredMissingBodyDoesNotBecomeSPAFallback(t *testing.T) {
 	})
 	save(t, c, r, nil)
 	h := handler(t, c, "")
-	if err := base.Delete(context.Background(), deploy.FileKey(r, "assets/app.js")); err != nil {
+	if err := base.Delete(context.Background(), deploy.BlobKey(r.Owner, r.Site, r.Files["assets/app.js"].SHA256)); err != nil {
 		t.Fatal(err)
 	}
 	if got := request(h, "GET", "foo.example.com", "/assets/app.js", map[string]string{"Accept": "text/html"}); got.Code != 404 || strings.Contains(got.Body.String(), "SPA") {
@@ -733,11 +742,13 @@ func TestPreviousAssetsUseNewestLeaseAndPropagateMetadataFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.fail(deploy.ServingFileKey(rel, "assets/app.js"), true)
-	if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 503 {
+	shard := deploy.ServingIndexKey(rel, deploy.IndexShard("assets/app.js"))
+	store.fail(shard, true)
+	// h holds the shard of the newer release; a reader without it must fail.
+	if got := request(handler(t, c, ""), "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 503 {
 		t.Fatalf("old file metadata failure became not found/stale asset: %d", got)
 	}
-	store.fail(deploy.ServingFileKey(rel, "assets/app.js"), false)
+	store.fail(shard, false)
 	store.fail(deploy.ServingReleaseKey(rel), true)
 	if got := request(h, "GET", "foo.example.com", "/assets/app.js", nil).Code; got != 200 {
 		t.Fatalf("cached immutable release reloaded unnecessarily: %d", got)

@@ -51,7 +51,11 @@ type Sync struct {
 	pendingMu           sync.Mutex
 	pendingFull         bool
 	pendingRepositories map[string]string
-	now                 func() time.Time
+	// blobsChecked records sites whose bodies were collected since start, so
+	// bodies left by a previous process are collected once without waiting for
+	// a release deletion. Guarded by mu.
+	blobsChecked map[string]bool
+	now          func() time.Time
 }
 
 func New(catalog *deploy.Catalog, cfg Config) (*Sync, error) {

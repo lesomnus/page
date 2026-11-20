@@ -79,6 +79,7 @@ func (s *Sync) persistAndCollect(ctx context.Context, site *deploy.Site) error {
 	// SaveSite may have observed an operator change made during the scan.
 	keep = retained(site, now)
 	var errs []error
+	deleted := 0
 	for id, retired := range site.Retired {
 		if keep[id] || now.Sub(retired) < s.cfg.GCGrace {
 			continue
@@ -93,10 +94,26 @@ func (s *Sync) persistAndCollect(ctx context.Context, site *deploy.Site) error {
 			continue
 		}
 		delete(site.Retired, id)
+		deleted++
 		slog.InfoContext(ctx, "release collected", "source", s.cfg.ID, "site", site.Name, "release", id)
 	}
 	if err := s.cat.SaveSite(ctx, site); err != nil {
 		errs = append(errs, err)
+	}
+	// persistAndCollect runs under s.mu, which also guards blobsChecked.
+	if deleted > 0 || !s.blobsChecked[site.Name] {
+		n, err := s.cat.CollectBlobs(ctx, site)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			if s.blobsChecked == nil {
+				s.blobsChecked = map[string]bool{}
+			}
+			s.blobsChecked[site.Name] = true
+			if n > 0 {
+				slog.InfoContext(ctx, "blobs collected", "source", s.cfg.ID, "site", site.Name, "count", n)
+			}
+		}
 	}
 	return errors.Join(errs...)
 }

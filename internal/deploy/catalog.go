@@ -21,6 +21,9 @@ import (
 
 const maxMetadata = 16 << 20
 
+// ValidFilePath reports whether p can name a file of a release.
+func ValidFilePath(p string) bool { return validPath(p) }
+
 func validPath(p string) bool {
 	return p != "" && p != "." && p == path.Clean(p) && !strings.HasPrefix(p, "/") && !strings.ContainsAny(p, "\\\x00") && p != ".." && !strings.HasPrefix(p, "../")
 }
@@ -210,7 +213,7 @@ func (c *Catalog) GetRelease(ctx context.Context, owner, site, id string) (*Rele
 		return nil, ErrInvalid
 	}
 	var r Release
-	if err := c.read(ctx, ReleasePrefix(owner, site, id)+"manifest.json", &r); err != nil {
+	if err := c.read(ctx, ReleasePrefix(owner, site, id)+releaseObject, &r); err != nil {
 		return nil, err
 	}
 	if err := validateRelease(&r); err != nil {
@@ -229,8 +232,9 @@ func (c *Catalog) GetRelease(ctx context.Context, owner, site, id string) (*Rele
 	return &r, nil
 }
 
-// Publish writes an owned upload marker, all file objects and serving metadata,
-// and finally the immutable manifest. It does not move any public reference.
+// Publish writes an owned upload marker, the file bodies the site does not
+// hold yet, serving metadata and finally the immutable manifest. It does not
+// move any public reference.
 func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin, files []InputFile) (*Release, error) {
 	if !ValidName(site) || !ValidName(owner) || origin.Kind == "" || origin.RepositoryID == "" || origin.Revision == "" || len(files) == 0 {
 		return nil, ErrInvalid
@@ -256,16 +260,10 @@ func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin
 		seen[f.Path] = true
 	}
 	r := &Release{SchemaVersion: SchemaVersion, ID: id, Site: site, Owner: owner, Origin: origin, CreatedAt: time.Now().UTC(), Files: map[string]File{}}
-	if err := c.write(ctx, ReleasePrefix(owner, site, id)+"upload.json", r); err != nil {
+	if err := c.write(ctx, ReleasePrefix(owner, site, id)+uploadObject, r); err != nil {
 		return nil, err
 	}
 	for _, f := range files {
-		body, err := f.Open()
-		if err != nil {
-			return nil, err
-		}
-		h := sha256.New()
-		count := &countWriter{w: h}
 		typ := f.ContentType
 		if typ == "" {
 			typ = mime.TypeByExtension(path.Ext(f.Path))
@@ -273,21 +271,14 @@ func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin
 		if typ == "" {
 			typ = "application/octet-stream"
 		}
-		_, putErr := c.Store.Put(ctx, FileKey(r, f.Path), io.TeeReader(io.LimitReader(body, f.Size+1), count), f.Size, typ)
-		if putErr != nil {
-			body.Close()
-			return nil, putErr
+		digest, err := digestInput(f)
+		if err != nil {
+			return nil, err
 		}
-		var extra [1]byte
-		n, readErr := body.Read(extra[:])
-		closeErr := body.Close()
-		if count.n != f.Size || n != 0 || readErr != io.EOF {
-			return nil, fmt.Errorf("%w: file length changed: %s", ErrInvalid, f.Path)
+		if err := c.putBlob(ctx, owner, site, f, digest, typ); err != nil {
+			return nil, err
 		}
-		if closeErr != nil {
-			return nil, closeErr
-		}
-		r.Files[f.Path] = File{Path: f.Path, Size: f.Size, ContentType: typ, SHA256: hex.EncodeToString(h.Sum(nil))}
+		r.Files[f.Path] = File{Path: f.Path, Size: f.Size, ContentType: typ, SHA256: digest}
 	}
 	if err := c.parsePagesForPublication(ctx, r); err != nil {
 		return nil, err
@@ -298,10 +289,64 @@ func (c *Catalog) Publish(ctx context.Context, site, owner string, origin Origin
 	if err := c.writeServingProjection(ctx, r); err != nil {
 		return nil, err
 	}
-	if err := c.write(ctx, ReleasePrefix(owner, site, id)+"manifest.json", r); err != nil {
+	if err := c.write(ctx, ReleasePrefix(owner, site, id)+releaseObject, r); err != nil {
 		return nil, err
 	}
 	return r, nil
+}
+
+// digestInput hashes one input and checks that it has its declared length.
+func digestInput(f InputFile) (string, error) {
+	body, err := f.Open()
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(body, f.Size+1))
+	closeErr := body.Close()
+	if err != nil {
+		return "", err
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if n != f.Size {
+		return "", fmt.Errorf("%w: file length changed: %s", ErrInvalid, f.Path)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// putBlob stores the body of f under its digest unless the site already holds
+// it. The body is read again and must still match the digest; a body that
+// changed in between is removed rather than left under a wrong address.
+func (c *Catalog) putBlob(ctx context.Context, owner, site string, f InputFile, digest, typ string) error {
+	key := BlobKey(owner, site, digest)
+	if info, err := c.Store.Stat(ctx, key); err == nil && info.Size == f.Size {
+		return nil
+	} else if err != nil && !errorsIsNotFound(err) {
+		return err
+	}
+	body, err := f.Open()
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	count := &countWriter{w: h}
+	_, putErr := c.Store.Put(ctx, key, io.TeeReader(io.LimitReader(body, f.Size+1), count), f.Size, typ)
+	if putErr != nil {
+		body.Close()
+		return putErr
+	}
+	var extra [1]byte
+	n, readErr := body.Read(extra[:])
+	closeErr := body.Close()
+	if count.n != f.Size || n != 0 || readErr != io.EOF || hex.EncodeToString(h.Sum(nil)) != digest {
+		if err := c.Store.Delete(ctx, key); err != nil && !errorsIsNotFound(err) {
+			return err
+		}
+		return fmt.Errorf("%w: file changed during upload: %s", ErrInvalid, f.Path)
+	}
+	return closeErr
 }
 
 type countWriter struct {
@@ -327,7 +372,7 @@ func (c *Catalog) ListReleases(ctx context.Context, owner, site string) ([]*Rele
 	ids := map[string]bool{}
 	for _, o := range objects {
 		parts := strings.Split(strings.TrimPrefix(o.Key, prefix), "/")
-		if len(parts) == 2 && ValidID(parts[0]) && (parts[1] == "manifest.json" || parts[1] == "upload.json") {
+		if len(parts) == 2 && ValidID(parts[0]) && (parts[1] == releaseObject || parts[1] == uploadObject) {
 			ids[parts[0]] = true
 		}
 	}
@@ -336,7 +381,7 @@ func (c *Catalog) ListReleases(ctx context.Context, owner, site string) ([]*Rele
 		r, err := c.GetRelease(ctx, owner, site, id)
 		if errorsIsNotFound(err) {
 			var pending Release
-			err = c.read(ctx, ReleasePrefix(owner, site, id)+"upload.json", &pending)
+			err = c.read(ctx, ReleasePrefix(owner, site, id)+uploadObject, &pending)
 			if err == nil {
 				err = validateRelease(&pending)
 				if pending.Owner != owner || pending.Site != site || pending.ID != id || pending.Complete {
@@ -380,7 +425,7 @@ func (c *Catalog) DeleteRelease(ctx context.Context, s *Site, id string) error {
 		// A failed first upload has no published Site yet. Its durable marker
 		// proves the same source owns this otherwise unreachable prefix.
 		var marker Release
-		err = c.read(ctx, ReleasePrefix(s.Owner, s.Name, id)+"upload.json", &marker)
+		err = c.read(ctx, ReleasePrefix(s.Owner, s.Name, id)+uploadObject, &marker)
 		if errorsIsNotFound(err) {
 			return nil
 		}
@@ -417,13 +462,13 @@ func (c *Catalog) DeleteRelease(ctx context.Context, s *Site, id string) error {
 	// The upload marker is deleted last so interrupted deletion stays discoverable.
 	sort.Slice(objects, func(i, j int) bool {
 		priority := func(key string) int {
-			if key == prefix+"manifest.json" {
+			if key == prefix+releaseObject {
 				return 0
 			}
-			if key == prefix+"serving.json" {
+			if key == prefix+servingObject {
 				return 1
 			}
-			if key == prefix+"upload.json" {
+			if key == prefix+uploadObject {
 				return 3
 			}
 			return 2
@@ -440,6 +485,56 @@ func (c *Catalog) DeleteRelease(ctx context.Context, s *Site, id string) error {
 		}
 	}
 	return nil
+}
+
+// BlobGrace keeps recently written bodies out of collection. A source
+// publishes and collects one site in sequence, so this only guards against an
+// unexpected second writer, not against the source's own uploads.
+const BlobGrace = time.Hour
+
+// CollectBlobs deletes the bodies of s that no release of s lists, complete
+// or pending. It returns how many it deleted.
+func (c *Catalog) CollectBlobs(ctx context.Context, s *Site) (int, error) {
+	c.mutation.Lock()
+	defer c.mutation.Unlock()
+	if !ValidName(s.Owner) || !ValidName(s.Name) {
+		return 0, ErrInvalid
+	}
+	if current, err := c.GetSite(ctx, s.Name); err == nil {
+		if current.Owner != s.Owner || current.RepositoryID != s.RepositoryID {
+			return 0, ErrOwnership
+		}
+	} else if !errorsIsNotFound(err) {
+		return 0, err
+	}
+	releases, err := c.ListReleases(ctx, s.Owner, s.Name)
+	if err != nil {
+		return 0, err
+	}
+	keep := map[string]bool{}
+	for _, r := range releases {
+		for _, f := range r.Files {
+			keep[f.SHA256] = true
+		}
+	}
+	prefix := blobPrefix(s.Owner, s.Name)
+	objects, err := c.list(ctx, prefix)
+	if err != nil {
+		return 0, err
+	}
+	now := c.now()
+	deleted := 0
+	for _, o := range objects {
+		digest := strings.TrimPrefix(o.Key, prefix)
+		if !ValidID(digest) || keep[digest] || now.Sub(o.Modified) < BlobGrace {
+			continue
+		}
+		if err := c.Store.Delete(ctx, o.Key); err != nil && !errorsIsNotFound(err) {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 func errorsIsNotFound(err error) bool { return errors.Is(err, storage.ErrNotFound) }

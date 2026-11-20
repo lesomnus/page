@@ -100,6 +100,14 @@ type Catalog struct {
 	Store    storage.Store
 	mutation sync.Mutex
 	changes  changeHub
+	clock    func() time.Time // tests only; nil means time.Now
+}
+
+func (c *Catalog) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
 }
 
 func New(store storage.Store) *Catalog { return &Catalog{Store: store} }
@@ -119,7 +127,23 @@ func SiteKey(name string) string { return "sites/" + name + "/site.json" }
 func ReleasePrefix(owner, site, id string) string {
 	return "sources/" + owner + "/sites/" + site + "/releases/" + id + "/"
 }
-func FileKey(r *Release, p string) string { return ReleasePrefix(r.Owner, r.Site, r.ID) + "files/" + p }
+
+// Release objects. Only the upload marker keeps its name from the first
+// storage format; the others are named so that the two formats never share a key.
+const (
+	uploadObject  = "upload.json"
+	releaseObject = "release.json"
+	servingObject = "serving-v2.json"
+	indexDir      = "index/"
+)
+
+// BlobKey addresses a file body by content within one site. Releases of the
+// site share it, so an unchanged file is stored once however often it is
+// published. Bodies are collected only when no release of the site lists them.
+func BlobKey(owner, site, digest string) string {
+	return "sources/" + owner + "/sites/" + site + "/blobs/" + digest
+}
+func blobPrefix(owner, site string) string { return "sources/" + owner + "/sites/" + site + "/blobs/" }
 
 // These capabilities deliberately contain no SQL driver or transaction.
 type Reader interface {

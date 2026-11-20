@@ -84,7 +84,7 @@ func TestTargetDisappearingBeforeActivationKeepsPriorPublication(t *testing.T) {
 	operatorIntent(t, cat, "pinned", target)
 	// Simulate an already in-flight collector that withdrew completeness after
 	// the controller validated the target, before the owner applied the intent.
-	if err := cat.Store.Delete(ctx, deploy.ReleasePrefix(before.Owner, before.Name, target)+"manifest.json"); err != nil {
+	if err := cat.Store.Delete(ctx, deploy.ReleasePrefix(before.Owner, before.Name, target)+"release.json"); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()

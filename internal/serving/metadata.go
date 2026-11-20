@@ -65,7 +65,7 @@ func (h *Handler) cachedRelease(ctx context.Context, site *deploy.Site, id strin
 	// same source identity and ID but a new CreatedAt. Scope immutable cached
 	// metadata to the publication that selected it, so both memory and disk
 	// tiers load the new incarnation after a later Site write.
-	key := deploy.ReleasePrefix(site.Owner, site.Name, id) + "serving.json@" + site.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	key := deploy.ReleasePrefix(site.Owner, site.Name, id) + "serving@" + site.UpdatedAt.UTC().Format(time.RFC3339Nano)
 	value, err := h.metadata.Get(ctx, key, metacache.Policy{
 		Mutable: false,
 		Load: func(ctx context.Context) ([]byte, string, error) {
@@ -96,4 +96,29 @@ func (h *Handler) cachedRelease(ctx context.Context, site *deploy.Site, id strin
 		return nil, errors.New("serving: release repository ownership mismatch")
 	}
 	return compiled, nil
+}
+
+// servingFile reads the record of p from the release's index shard. A shard
+// belongs to one incarnation of a complete release and never changes, so it is
+// cached as immutable under that incarnation's CreatedAt.
+func (h *Handler) servingFile(ctx context.Context, rel *deploy.ServingRelease, p string) (*deploy.ServingFile, error) {
+	if !deploy.ValidFilePath(p) {
+		return nil, deploy.ErrInvalid
+	}
+	shard := deploy.IndexShard(p)
+	key := deploy.ServingIndexKey(rel, shard) + "@" + rel.CreatedAt.UTC().Format(time.RFC3339Nano)
+	value, err := h.metadata.Get(ctx, key, metacache.Policy{
+		Mutable: false,
+		Load: func(ctx context.Context) ([]byte, string, error) {
+			data, err := h.catalog.LoadServingIndex(ctx, rel, shard)
+			return data, "", err
+		},
+		Decode: func(data []byte) (any, error) {
+			return deploy.DecodeServingIndex(data, rel, shard)
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return value.(*deploy.ServingIndex).Lookup(p)
 }

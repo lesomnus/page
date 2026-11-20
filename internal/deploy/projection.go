@@ -15,12 +15,15 @@ import (
 	"time"
 
 	"github.com/lesomnus/page/internal/routes"
+	"github.com/lesomnus/page/internal/storage"
 )
 
 const (
-	fileMetadataVersion       = 1
+	fileMetadataVersion       = 2
 	maxServingReleaseMetadata = 128 << 10
-	maxServingFileMetadata    = 16 << 10
+	// A release holds at most a few tens of thousands of files spread over 256
+	// shards; this bounds one shard far above that while keeping a lookup small.
+	maxServingIndexMetadata = 4 << 20
 )
 
 // ServingRelease contains only release-scoped routing and identity. File
@@ -37,7 +40,7 @@ type ServingRelease struct {
 	FileMetadataVersion int            `json:"fileMetadataVersion"`
 }
 
-// ServingFile is a point-readable file record. Its envelope prevents a record
+// ServingFile is one file record of a release. Its envelope prevents a record
 // copied from another release or another path from authorizing a body lookup.
 type ServingFile struct {
 	SchemaVersion int       `json:"schemaVersion"`
@@ -51,19 +54,42 @@ type ServingFile struct {
 }
 
 func ServingReleaseKey(r *ServingRelease) string {
-	return ReleasePrefix(r.Owner, r.Site, r.ID) + "serving.json"
+	return ReleasePrefix(r.Owner, r.Site, r.ID) + servingObject
 }
 
-// ServingFileKey hashes the complete original path rather than creating a
+// ServingIndex is one shard of a release's file records. Paths are sharded by
+// the first byte of their SHA-256, so a lookup reads one small object and the
+// release is written as at most 256 objects however many files it has. The
+// envelope is checked per shard, as it was per file record.
+type ServingIndex struct {
+	SchemaVersion int                          `json:"schemaVersion"`
+	Owner         string                       `json:"owner"`
+	Site          string                       `json:"site"`
+	ReleaseID     string                       `json:"releaseId"`
+	RepositoryID  string                       `json:"repositoryId"`
+	CreatedAt     time.Time                    `json:"createdAt"`
+	Shard         string                       `json:"shard"`
+	Files         map[string]ServingIndexEntry `json:"files"`
+}
+
+type ServingIndexEntry struct {
+	File      File `json:"file"`
+	Immutable bool `json:"immutable,omitempty"`
+}
+
+// IndexShard hashes the complete original path rather than creating a
 // hierarchy from it. Thus a file named "a" cannot collide with "a/b" metadata.
-func ServingFileKey(r *ServingRelease, p string) string {
+func IndexShard(p string) string {
 	h := sha256.Sum256([]byte(p))
-	return ReleasePrefix(r.Owner, r.Site, r.ID) + "metadata/" + hex.EncodeToString(h[:]) + ".json"
+	return hex.EncodeToString(h[:1])
 }
 
-func ServingObjectKey(r *ServingRelease, p string) string {
-	return ReleasePrefix(r.Owner, r.Site, r.ID) + "files/" + p
+func ServingIndexKey(r *ServingRelease, shard string) string {
+	return ReleasePrefix(r.Owner, r.Site, r.ID) + indexDir + shard + ".json"
 }
+
+// ServingBlobKey is where the body of a file record of r is stored.
+func ServingBlobKey(r *ServingRelease, f File) string { return BlobKey(r.Owner, r.Site, f.SHA256) }
 
 func servingRelease(r *Release) *ServingRelease {
 	return &ServingRelease{SchemaVersion: r.SchemaVersion, ID: r.ID, Site: r.Site, Owner: r.Owner, Origin: r.Origin, CreatedAt: r.CreatedAt, Complete: r.Complete, Pages: r.Pages, FileMetadataVersion: fileMetadataVersion}
@@ -94,6 +120,35 @@ func validateServingFile(r *ServingRelease, p string, f *ServingFile) error {
 	return nil
 }
 
+func validateServingIndex(r *ServingRelease, shard string, x *ServingIndex) error {
+	if x.SchemaVersion != SchemaVersion || x.Owner != r.Owner || x.Site != r.Site || x.ReleaseID != r.ID || x.RepositoryID != r.Origin.RepositoryID || !x.CreatedAt.Equal(r.CreatedAt) || x.Shard != shard {
+		return fmt.Errorf("%w: serving index identity or schema", ErrInvalid)
+	}
+	for p, e := range x.Files {
+		if IndexShard(p) != shard {
+			return fmt.Errorf("%w: serving index shard", ErrInvalid)
+		}
+		if err := validateServingFile(r, p, x.file(p, e)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (x *ServingIndex) file(p string, e ServingIndexEntry) *ServingFile {
+	return &ServingFile{SchemaVersion: x.SchemaVersion, Owner: x.Owner, Site: x.Site, ReleaseID: x.ReleaseID, RepositoryID: x.RepositoryID, CreatedAt: x.CreatedAt, File: e.File, Immutable: e.Immutable}
+}
+
+// Lookup returns the record of p, or storage.ErrNotFound when the release has
+// no such file.
+func (x *ServingIndex) Lookup(p string) (*ServingFile, error) {
+	e, ok := x.Files[p]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	return x.file(p, e), nil
+}
+
 func validateFile(p string, f File) error {
 	if !validPath(p) || f.Path != p || f.Size < 0 || len(f.SHA256) != 64 || f.ContentType == "" {
 		return fmt.Errorf("%w: release file %q", ErrInvalid, p)
@@ -111,25 +166,33 @@ func immutableFileAllowed(f File) bool {
 }
 
 func (c *Catalog) readBounded(ctx context.Context, key string, limit int64, v any) error {
-	body, info, err := c.Store.Get(ctx, key)
+	b, err := c.readRaw(ctx, key, limit)
 	if err != nil {
 		return err
-	}
-	defer body.Close()
-	if info.Size < 0 || info.Size > limit {
-		return fmt.Errorf("%w: metadata too large", ErrInvalid)
-	}
-	b, err := io.ReadAll(io.LimitReader(body, limit+1))
-	if err != nil {
-		return err
-	}
-	if int64(len(b)) > limit {
-		return fmt.Errorf("%w: metadata too large", ErrInvalid)
 	}
 	if err := json.Unmarshal(b, v); err != nil {
 		return fmt.Errorf("%w: %s: %v", ErrInvalid, key, err)
 	}
 	return nil
+}
+
+func (c *Catalog) readRaw(ctx context.Context, key string, limit int64) ([]byte, error) {
+	body, info, err := c.Store.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	if info.Size < 0 || info.Size > limit {
+		return nil, fmt.Errorf("%w: metadata too large", ErrInvalid)
+	}
+	b, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w: metadata too large", ErrInvalid)
+	}
+	return b, nil
 }
 
 func (c *Catalog) writeBounded(ctx context.Context, key string, limit int, v any) error {
@@ -153,7 +216,7 @@ func (c *Catalog) GetServingRelease(ctx context.Context, owner, site, id string)
 	if !ValidName(owner) || !ValidName(site) || !ValidID(id) {
 		return nil, ErrInvalid
 	}
-	info, err := c.Store.Stat(ctx, ReleasePrefix(owner, site, id)+"manifest.json")
+	info, err := c.Store.Stat(ctx, ReleasePrefix(owner, site, id)+releaseObject)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +224,7 @@ func (c *Catalog) GetServingRelease(ctx context.Context, owner, site, id string)
 		return nil, fmt.Errorf("%w: metadata too large", ErrInvalid)
 	}
 	r := &ServingRelease{}
-	err = c.readBounded(ctx, ReleasePrefix(owner, site, id)+"serving.json", maxServingReleaseMetadata, r)
+	err = c.readBounded(ctx, ReleasePrefix(owner, site, id)+servingObject, maxServingReleaseMetadata, r)
 	if err != nil {
 		return nil, err
 	}
@@ -187,23 +250,49 @@ func DecodeServingRelease(data []byte, owner, site, id string) (*ServingRelease,
 	return &release, nil
 }
 
-// GetServingFile reads one required file record without loading the writer's
-// inventory. Missing sidecar metadata means the file is not published.
-func (c *Catalog) GetServingFile(ctx context.Context, r *ServingRelease, p string) (*ServingFile, error) {
-	if r == nil || !ValidName(r.Owner) || !ValidName(r.Site) || !ValidID(r.ID) || !validPath(p) {
+// LoadServingIndex reads one index shard of r without loading the writer's
+// inventory. A missing shard means the release has no file in it.
+func (c *Catalog) LoadServingIndex(ctx context.Context, r *ServingRelease, shard string) ([]byte, error) {
+	if r == nil || !ValidName(r.Owner) || !ValidName(r.Site) || !ValidID(r.ID) || len(shard) != 2 {
 		return nil, ErrInvalid
 	}
 	if err := validateServingRelease(r, r.Owner, r.Site, r.ID); err != nil {
 		return nil, err
 	}
-	var f ServingFile
-	if err := c.readBounded(ctx, ServingFileKey(r, p), maxServingFileMetadata, &f); err != nil {
+	return c.readRaw(ctx, ServingIndexKey(r, shard), maxServingIndexMetadata)
+}
+
+// DecodeServingIndex validates a shard read by LoadServingIndex or a cache.
+func DecodeServingIndex(data []byte, r *ServingRelease, shard string) (*ServingIndex, error) {
+	if len(data) > maxServingIndexMetadata {
+		return nil, ErrInvalid
+	}
+	var x ServingIndex
+	if err := json.Unmarshal(data, &x); err != nil {
+		return nil, fmt.Errorf("%w: serving index: %v", ErrInvalid, err)
+	}
+	if err := validateServingIndex(r, shard, &x); err != nil {
 		return nil, err
 	}
-	if err := validateServingFile(r, p, &f); err != nil {
+	return &x, nil
+}
+
+// GetServingFile reads the record of one path without a cache. Serving reads
+// the same shards through its metadata cache.
+func (c *Catalog) GetServingFile(ctx context.Context, r *ServingRelease, p string) (*ServingFile, error) {
+	if !validPath(p) {
+		return nil, ErrInvalid
+	}
+	shard := IndexShard(p)
+	data, err := c.LoadServingIndex(ctx, r, shard)
+	if err != nil {
 		return nil, err
 	}
-	return &f, nil
+	x, err := DecodeServingIndex(data, r, shard)
+	if err != nil {
+		return nil, err
+	}
+	return x.Lookup(p)
 }
 
 func (c *Catalog) writeServingProjection(ctx context.Context, r *Release) error {
@@ -212,17 +301,27 @@ func (c *Catalog) writeServingProjection(ctx context.Context, r *Release) error 
 		return err
 	}
 	header := servingRelease(r)
-	paths := make([]string, 0, len(r.Files))
-	for p := range r.Files {
-		paths = append(paths, p)
+	shards := map[string]*ServingIndex{}
+	for p, f := range r.Files {
+		shard := IndexShard(p)
+		x := shards[shard]
+		if x == nil {
+			x = &ServingIndex{SchemaVersion: SchemaVersion, Owner: r.Owner, Site: r.Site, ReleaseID: r.ID, RepositoryID: r.Origin.RepositoryID, CreatedAt: r.CreatedAt, Shard: shard, Files: map[string]ServingIndexEntry{}}
+			shards[shard] = x
+		}
+		x.Files[p] = ServingIndexEntry{File: f, Immutable: e.Immutable(p)}
 	}
-	sort.Strings(paths)
-	for _, p := range paths {
-		f := ServingFile{SchemaVersion: SchemaVersion, Owner: r.Owner, Site: r.Site, ReleaseID: r.ID, RepositoryID: r.Origin.RepositoryID, CreatedAt: r.CreatedAt, File: r.Files[p], Immutable: e.Immutable(p)}
-		if err := validateServingFile(header, p, &f); err != nil {
+	names := make([]string, 0, len(shards))
+	for shard := range shards {
+		names = append(names, shard)
+	}
+	sort.Strings(names)
+	for _, shard := range names {
+		x := shards[shard]
+		if err := validateServingIndex(header, shard, x); err != nil {
 			return err
 		}
-		if err := c.writeBounded(ctx, ServingFileKey(header, p), maxServingFileMetadata, &f); err != nil {
+		if err := c.writeBounded(ctx, ServingIndexKey(header, shard), maxServingIndexMetadata, x); err != nil {
 			return err
 		}
 	}
