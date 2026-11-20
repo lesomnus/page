@@ -135,3 +135,54 @@ func TestInvalidMetadataAndInput(t *testing.T) {
 		t.Fatalf("unknown schema accepted: %v", err)
 	}
 }
+
+// putCounter counts writes per key so tests can assert that a no-op pass is free.
+type putCounter struct {
+	storage.Store
+	puts map[string]int
+}
+
+func (p *putCounter) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) (storage.Info, error) {
+	p.puts[key]++
+	return p.Store.Put(ctx, key, r, size, contentType)
+}
+
+func TestSaveSiteSkipsUnchangedSite(t *testing.T) {
+	ctx := context.Background()
+	store := &putCounter{Store: storage.NewMemory(), puts: map[string]int{}}
+	c := New(store)
+	r, err := c.Publish(ctx, "foo", "source-foo", origin("commit-1"), []InputFile{input("index.html", "old")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := siteFor(r)
+	if err = c.SaveSite(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	first := s.UpdatedAt
+	again := siteFor(r)
+	if err = c.SaveSite(ctx, again); err != nil {
+		t.Fatal(err)
+	}
+	if n := store.puts[SiteKey("foo")]; n != 1 {
+		t.Fatalf("unchanged site written %d times", n)
+	}
+	if !again.UpdatedAt.Equal(first) {
+		t.Fatalf("no-op save moved UpdatedAt %v→%v", first, again.UpdatedAt)
+	}
+	r2, err := c.Publish(ctx, "foo", "source-foo", origin("commit-2"), []InputFile{input("index.html", "new")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := siteFor(r2)
+	if err = c.SaveSite(ctx, changed); err != nil {
+		t.Fatal(err)
+	}
+	if n := store.puts[SiteKey("foo")]; n != 2 {
+		t.Fatalf("changed site written %d times in total, want 2", n)
+	}
+	got, err := c.GetSite(ctx, "foo")
+	if err != nil || got.Production != r2.ID || !got.UpdatedAt.After(first) {
+		t.Fatalf("changed site not stored: %+v %v", got, err)
+	}
+}
