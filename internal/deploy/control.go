@@ -110,7 +110,7 @@ func (c *Catalog) setControl(ctx context.Context, name, owner, mode, target stri
 		return nil, ErrInvalid
 	}
 	ctrl := &Control{SchemaVersion: SchemaVersion, Owner: s.Owner, RepositoryID: s.RepositoryID, Mode: mode, Target: target, UpdatedAt: time.Now().UTC()}
-	if e = c.prepareSite(ctx, s, ctrl); e != nil {
+	if _, e = c.prepareSite(ctx, s, ctrl); e != nil {
 		return nil, e
 	}
 	if e = c.write(ctx, ControlKey(name), ctrl); e != nil {
@@ -162,29 +162,31 @@ func (c *Catalog) rollback(ctx context.Context, name, owner, target string, mate
 
 // prepareSite merges durable lifecycle state with the writer's proposed view.
 // Local writes share mutation; independent processes follow the one-owner rule.
-func (c *Catalog) prepareSite(ctx context.Context, s *Site, override *Control) error {
+// prepareSite derives s from its stored predecessor and returns that
+// predecessor, or nil when the site has not been published yet.
+func (c *Catalog) prepareSite(ctx context.Context, s *Site, override *Control) (*Site, error) {
 	if e := validateSite(s); e != nil {
-		return e
+		return nil, e
 	}
 	old, e := c.GetSite(ctx, s.Name)
 	if e != nil && !errorsIsNotFound(e) {
-		return e
+		return nil, e
 	}
 	if errorsIsNotFound(e) {
 		old = nil
 	}
 	if old != nil && (old.Owner != s.Owner || old.RepositoryID != s.RepositoryID) {
-		return ErrOwnership
+		return nil, ErrOwnership
 	}
 	ctrl := override
 	if ctrl == nil {
 		ctrl, e = c.GetControl(ctx, s)
 		if e != nil {
-			return e
+			return nil, e
 		}
 	}
 	if e = c.apply(ctx, s, ctrl); e != nil {
-		return e
+		return nil, e
 	}
 	s.ControlAppliedAt = ctrl.UpdatedAt
 	now := time.Now().UTC()
@@ -205,7 +207,7 @@ func (c *Catalog) prepareSite(ctx context.Context, s *Site, override *Control) e
 			if !s.Disabled && s.AssetRetention > 0 {
 				previous, e := c.GetRelease(ctx, old.Owner, old.Name, old.Production)
 				if e != nil {
-					return e
+					return nil, e
 				}
 				if previous.Pages != nil && len(previous.Pages.Assets.Immutable) > 0 {
 					leases[old.Production] = now.Add(s.AssetRetention)
@@ -245,16 +247,16 @@ func (c *Catalog) prepareSite(ctx context.Context, s *Site, override *Control) e
 	for id := range refs {
 		r, e := c.GetRelease(ctx, s.Owner, s.Name, id)
 		if e != nil {
-			return e
+			return nil, e
 		}
 		if r.Origin.RepositoryID != s.RepositoryID {
-			return fmt.Errorf("%w: release repository mismatch", ErrInvalid)
+			return nil, fmt.Errorf("%w: release repository mismatch", ErrInvalid)
 		}
 		loaded[id] = r
 	}
 	for _, a := range s.Aliases {
 		if a.Revision != loaded[a.Release].Origin.Revision {
-			return fmt.Errorf("%w: alias revision mismatch", ErrInvalid)
+			return nil, fmt.Errorf("%w: alias revision mismatch", ErrInvalid)
 		}
 	}
 	if s.Production != "" && (old == nil || old.Production != s.Production) {
@@ -273,11 +275,11 @@ func (c *Catalog) prepareSite(ctx context.Context, s *Site, override *Control) e
 			if r == nil {
 				r, e = c.GetRelease(ctx, s.Owner, s.Name, id)
 				if e != nil {
-					return e
+					return nil, e
 				}
 			}
 			if e = immutableCompatible(r, loaded[s.Production]); e != nil {
-				return e
+				return nil, e
 			}
 		}
 	}
@@ -285,5 +287,5 @@ func (c *Catalog) prepareSite(ctx context.Context, s *Site, override *Control) e
 	if s.CreatedAt.IsZero() {
 		s.CreatedAt = now
 	}
-	return validateSite(s)
+	return old, validateSite(s)
 }

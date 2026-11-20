@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -161,10 +162,47 @@ func (c *Catalog) ListSites(ctx context.Context) ([]*Site, error) {
 func (c *Catalog) SaveSite(ctx context.Context, s *Site) error {
 	c.mutation.Lock()
 	defer c.mutation.Unlock()
-	if err := c.prepareSite(ctx, s, nil); err != nil {
+	old, err := c.prepareSite(ctx, s, nil)
+	if err != nil {
 		return err
 	}
+	// A pass that changes nothing keeps the stored object. Rewriting it would
+	// only move UpdatedAt, which re-keys serving caches and costs a storage
+	// write. Local watchers are still told, as for a write: a save is also how
+	// a source asks serving to retry a refresh that failed earlier.
+	if same, err := sameSite(old, s); err != nil {
+		return err
+	} else if same {
+		s.UpdatedAt = old.UpdatedAt
+		c.notifyWrite(SiteKey(s.Name))
+		return nil
+	}
 	return c.write(ctx, SiteKey(s.Name), s)
+}
+
+// sameSite reports whether next differs from prev only in UpdatedAt.
+func sameSite(prev, next *Site) (bool, error) {
+	if prev == nil {
+		return false, nil
+	}
+	a := *prev
+	b := *next
+	a.UpdatedAt, b.UpdatedAt = time.Time{}, time.Time{}
+	// A stored "aliases": {} decodes to an empty map; a derived site may hold nil.
+	for _, s := range []*Site{&a, &b} {
+		if s.Aliases == nil {
+			s.Aliases = map[string]Alias{}
+		}
+	}
+	x, err := json.Marshal(&a)
+	if err != nil {
+		return false, err
+	}
+	y, err := json.Marshal(&b)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(x, y), nil
 }
 
 func (c *Catalog) GetRelease(ctx context.Context, owner, site, id string) (*Release, error) {
